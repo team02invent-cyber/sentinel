@@ -1,23 +1,85 @@
+"use client"
+
+import { useSentinel } from "@/hooks/use-sentinel"
+import { HeaderBar } from "@/components/sentinel/header-bar"
+import { ControlDeck } from "@/components/sentinel/control-deck"
+import { MetricsRibbon } from "@/components/sentinel/metrics-ribbon"
+import { TopologyMap } from "@/components/sentinel/topology-map"
+import { PredictionTimeline } from "@/components/sentinel/prediction-timeline"
+import { CopilotPanel } from "@/components/sentinel/copilot-panel"
+import { EventFeed } from "@/components/sentinel/event-feed"
+
 export default function Page() {
+  const {
+    snap,
+    selected,
+    setSelected,
+    injectFault,
+    remediate,
+    togglePass,
+    toggleAirGap,
+    toggleRunning,
+    running,
+    nodeSeries,
+    linkSeries,
+  } = useSentinel()
+
   return (
-    <main className="relative flex min-h-screen items-center justify-center bg-[color:light-dark(#fff,#000)] text-[color:light-dark(#000,#fff)]">
-      <svg
-        aria-hidden="true"
-        className="size-20"
-        fill="none"
-        viewBox="0 0 20 20"
-        xmlns="http://www.w3.org/2000/svg"
-        stroke="currentColor"
-        strokeWidth="0.5"
-      >
-        <path
-          d="M14.2 14.2H17V6.9375C17 4.76288 15.2371 3 13.0625 3H5.8V5.8M14.2 14.2V7.79063L7.79062 14.2H14.2ZM14.2 14.2V17H6.9375C4.76288 17 3 15.2371 3 13.0625V5.8H5.8M5.8 5.8V12.2313L12.2313 5.8H5.8Z"
-          strokeLinejoin="round"
+    <main className="flex min-h-screen flex-col bg-background">
+      <HeaderBar t={snap.t} airGapped={snap.airGapped} />
+
+      <div className="flex flex-1 flex-col gap-3 p-3">
+        <ControlDeck
+          passActive={snap.passActive}
+          airGapped={snap.airGapped}
+          running={running}
+          faultActive={!!snap.event}
+          onInject={injectFault}
+          onTogglePass={togglePass}
+          onToggleAirGap={toggleAirGap}
+          onToggleRunning={toggleRunning}
         />
-      </svg>
-      <p className="absolute left-1/2 top-[calc(50%+56px)] -translate-x-1/2 whitespace-nowrap text-sm font-medium text-muted-foreground">
-        Your v0 generation will show here.
-      </p>
+
+        <MetricsRibbon metrics={snap.metrics} />
+
+        <div className="grid flex-1 grid-cols-1 gap-3 lg:grid-cols-3">
+          {/* left + center: topology and timeline */}
+          <div className="flex flex-col gap-3 lg:col-span-2">
+            <div className="min-h-[360px] flex-1">
+              <TopologyMap
+                frame={snap.frame}
+                event={snap.event}
+                selected={selected}
+                onSelect={setSelected}
+              />
+            </div>
+            <div className="h-[260px]">
+              <PredictionTimeline
+                frame={snap.frame}
+                event={snap.event}
+                selected={selected}
+                nodeSeries={nodeSeries}
+                linkSeries={linkSeries}
+              />
+            </div>
+          </div>
+
+          {/* right: copilot + event log */}
+          <div className="flex flex-col gap-3">
+            <div className="min-h-[420px] flex-1">
+              <CopilotPanel
+                event={snap.event}
+                copilot={snap.copilot}
+                airGapped={snap.airGapped}
+                onRemediate={remediate}
+              />
+            </div>
+            <div className="h-[200px]">
+              <EventFeed log={snap.eventLog} />
+            </div>
+          </div>
+        </div>
+      </div>
     </main>
   )
 }
