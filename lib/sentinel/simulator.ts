@@ -29,7 +29,7 @@ import {
   type SessionMetrics,
   type TelemetryFrame,
 } from "./schema"
-import { LINKS, NODES, PRIMARY_LSP_PATH } from "./topology"
+import { LINKS, NODES, PRIMARY_LSP_PATH, PROTECT_LSP_PATH } from "./topology"
 
 const HISTORY = 120 // seconds of rolling history
 const PASS_MBPS = 800
@@ -52,6 +52,22 @@ interface ActiveFault {
   detected: boolean
   impacted: boolean
   eventId: string
+}
+
+/** Visible post-remediation recovery window (the "money-shot"). */
+export interface RecoveryState {
+  eventId: string
+  element: string
+  kind: "node" | "link"
+  faultClass: FaultClass
+  startT: number
+  durationS: number
+  /** Packets that would have dropped, avoided by acting before impact. */
+  packetsPrevented: number
+  /** True if remediation landed before any packet loss. */
+  prevented: boolean
+  /** True if the pass LSP was switched onto the protect path. */
+  rerouted: boolean
 }
 
 function clamp(v: number, lo: number, hi: number) {
