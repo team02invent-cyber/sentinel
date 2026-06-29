@@ -33,6 +33,8 @@ export function useSentinel() {
 
   const [running, setRunning] = useState(true)
   const [selected, setSelected] = useState<string | null>(null)
+  const [demoStep, setDemoStep] = useState<string | null>(null)
+  const demoCancelRef = useRef<(() => void) | null>(null)
   const [snap, setSnap] = useState<SentinelSnapshot>({
     frame: null,
     event: null,
@@ -105,6 +107,23 @@ export function useSentinel() {
   }, [])
   const toggleRunning = useCallback(() => setRunning((r) => !r), [])
 
+  const reset = useCallback(() => {
+    demoCancelRef.current?.()
+    demoCancelRef.current = null
+    setDemoStep(null)
+    copilotCache.current = null
+    engineRef.current!.reset()
+  }, [])
+
+  const runDemo = useCallback(() => {
+    demoCancelRef.current?.()
+    copilotCache.current = null
+    engineRef.current!.reset()
+    setRunning(true)
+    const cancel = engineRef.current!.runDemoScript((step) => setDemoStep(step))
+    demoCancelRef.current = cancel
+  }, [])
+
   const nodeSeries = useCallback(
     (id: string, key: Parameters<SentinelEngine["nodeSeries"]>[1]) =>
       engineRef.current!.nodeSeries(id, key),
@@ -126,6 +145,9 @@ export function useSentinel() {
     togglePass,
     toggleAirGap,
     toggleRunning,
+    reset,
+    runDemo,
+    demoStep,
     running,
     nodeSeries,
     linkSeries,

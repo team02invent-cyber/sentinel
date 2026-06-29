@@ -608,6 +608,67 @@ export class SentinelEngine {
     this.airGapped = on
   }
 
+  /**
+   * Reset the engine to a clean nominal state — no active fault, no recovery,
+   * cleared event log and session metrics. The sim clock continues.
+   */
+  reset() {
+    this.active = null
+    this.event = null
+    this.recovery = null
+    this.eventLog = []
+    this.metrics = {
+      injectedFaults: 0,
+      truePositives: 0,
+      falseAlarms: 0,
+      tpr: 0,
+      farPer10Min: 0,
+      leadTimesS: [],
+      medianLeadTimeS: 0,
+      packetsLossPrevented: 0,
+      reactiveMttdS: 180,
+      reactiveMttrS: 1500,
+    }
+    for (const n of NODES) this.nodeHist[n.id] = []
+    for (const l of LINKS) this.linkHist[l.id] = []
+    this.tHist = []
+    this.t = 0
+  }
+
+  /**
+   * Run the scripted 4-minute demo sequence automatically:
+   * T+0   : start the pass
+   * T+5   : inject link flap
+   * T+~10 : detection fires -> Copilot panel activates (engine-driven)
+   * T+20  : operator applies remediation (called from here)
+   * T+45  : inject LDP churn
+   * T+~50 : detection fires
+   * T+65  : operator applies remediation
+   * T+90  : inject congestion
+   * Returns a cancel function.
+   */
+  runDemoScript(onStep: (step: string) => void): () => void {
+    const timers: ReturnType<typeof setTimeout>[] = []
+    const s = (ms: number, fn: () => void, label: string) => {
+      timers.push(
+        setTimeout(() => {
+          fn()
+          onStep(label)
+        }, ms),
+      )
+    }
+
+    s(500, () => { this.setPass(true) }, "Pass activated")
+    s(3000, () => { this.injectFault("link_flap") }, "Injecting link flap…")
+    s(8000, () => { this.remediate() }, "Applying remediation (link flap)")
+    s(22000, () => { this.injectFault("ldp_instability") }, "Injecting LDP churn…")
+    s(30000, () => { this.remediate() }, "Applying remediation (LDP churn)")
+    s(44000, () => { this.injectFault("congestion") }, "Injecting congestion…")
+    s(52000, () => { this.remediate() }, "Applying remediation (congestion)")
+
+    return () => timers.forEach(clearTimeout)
+  }
+
   /** Series for charts: a single numeric metric over history for an element. */
   nodeSeries(id: string, key: keyof NodeMetrics): number[] {
     return this.nodeHist[id]?.map((m) => m[key] as number) ?? []

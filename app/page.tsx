@@ -9,6 +9,8 @@ import { TopologyMap } from "@/components/sentinel/topology-map"
 import { PredictionTimeline } from "@/components/sentinel/prediction-timeline"
 import { CopilotPanel } from "@/components/sentinel/copilot-panel"
 import { EventFeed } from "@/components/sentinel/event-feed"
+import { AirgapPanel } from "@/components/sentinel/airgap-panel"
+import { EvalPanel } from "@/components/sentinel/eval-panel"
 
 export default function Page() {
   const {
@@ -21,6 +23,9 @@ export default function Page() {
     togglePass,
     toggleAirGap,
     toggleRunning,
+    reset,
+    runDemo,
+    demoStep,
     running,
     nodeSeries,
     linkSeries,
@@ -36,11 +41,14 @@ export default function Page() {
           airGapped={snap.airGapped}
           running={running}
           faultActive={!!snap.event}
+          demoStep={demoStep}
           onInject={injectFault}
           onInjectTransient={injectTransient}
           onTogglePass={togglePass}
           onToggleAirGap={toggleAirGap}
           onToggleRunning={toggleRunning}
+          onReset={reset}
+          onRunDemo={runDemo}
         />
 
         {snap.airGapped && <ResilienceBanner running={running} />}
@@ -85,6 +93,16 @@ export default function Page() {
             <div className="h-[200px]">
               <EventFeed log={snap.eventLog} />
             </div>
+          </div>
+        </div>
+
+        {/* Bottom row: air-gap boundary + evaluation methodology */}
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          <div className="min-h-[380px]">
+            <AirgapPanel airGapped={snap.airGapped} running={running} />
+          </div>
+          <div className="min-h-[380px]">
+            <EvalPanel />
           </div>
         </div>
       </div>
