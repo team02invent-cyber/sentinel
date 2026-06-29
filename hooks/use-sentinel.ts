@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { generateCopilotResponse } from "@/lib/sentinel/copilot"
-import { SentinelEngine } from "@/lib/sentinel/simulator"
+import { SentinelEngine, type RecoveryState } from "@/lib/sentinel/simulator"
 import type {
   CopilotResponse,
   FaultClass,
@@ -20,6 +20,7 @@ export interface SentinelSnapshot {
   copilot: CopilotResponse | null
   metrics: SessionMetrics
   eventLog: PredictionEvent[]
+  recovery: RecoveryState | null
   passActive: boolean
   airGapped: boolean
   running: boolean
@@ -38,6 +39,7 @@ export function useSentinel() {
     copilot: null,
     metrics: engineRef.current.metrics,
     eventLog: [],
+    recovery: null,
     passActive: false,
     airGapped: false,
     running: true,
@@ -74,6 +76,7 @@ export function useSentinel() {
         copilot,
         metrics: { ...engine.metrics },
         eventLog: [...engine.eventLog],
+        recovery: engine.recovery ? { ...engine.recovery } : null,
         passActive: engine.passActive,
         airGapped: engine.airGapped,
         running: true,
@@ -85,6 +88,9 @@ export function useSentinel() {
 
   const injectFault = useCallback((cls: FaultClass) => {
     engineRef.current!.injectFault(cls)
+  }, [])
+  const injectTransient = useCallback(() => {
+    engineRef.current!.injectTransient()
   }, [])
   const remediate = useCallback(() => {
     engineRef.current!.remediate()
@@ -115,6 +121,7 @@ export function useSentinel() {
     selected,
     setSelected,
     injectFault,
+    injectTransient,
     remediate,
     togglePass,
     toggleAirGap,

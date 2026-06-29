@@ -50,10 +50,19 @@ export function PredictionTimeline({ frame, event, selected, nodeSeries, linkSer
 
   const inWindow = event && (event.phase === "degrading" || event.phase === "imminent")
   const failed = event?.phase === "failed"
+  const recovering = event?.phase === "recovering"
   const tti = event?.timeToImpactS ?? 0
 
   // Predicted window starts where "now minus lead time" sits in the 120s view.
   const predictedFrom = inWindow ? 0.72 : null
+
+  const lineColor = failed
+    ? "var(--crit)"
+    : recovering
+      ? "var(--info)"
+      : inWindow
+        ? "var(--warn)"
+        : "var(--primary)"
 
   return (
     <div className="flex h-full flex-col rounded-lg border border-border bg-card p-4">
@@ -80,7 +89,7 @@ export function PredictionTimeline({ frame, event, selected, nodeSeries, linkSer
           data={sig.data}
           max={sig.max}
           height={120}
-          color={failed ? "var(--crit)" : inWindow ? "var(--warn)" : "var(--primary)"}
+          color={lineColor}
           predictedFrom={predictedFrom}
           className="h-full w-full"
         />
@@ -92,6 +101,7 @@ export function PredictionTimeline({ frame, event, selected, nodeSeries, linkSer
           now: {sig.data.length ? `${sig.data[sig.data.length - 1].toFixed(1)} ${sig.unit}` : "—"}
         </span>
         {inWindow && <span className="text-[color:var(--warn)]">shaded = predicted failure window</span>}
+        {recovering && <span className="text-[color:var(--info)]">taper-healing to nominal</span>}
       </div>
     </div>
   )

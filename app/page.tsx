@@ -3,6 +3,7 @@
 import { useSentinel } from "@/hooks/use-sentinel"
 import { HeaderBar } from "@/components/sentinel/header-bar"
 import { ControlDeck } from "@/components/sentinel/control-deck"
+import { ResilienceBanner } from "@/components/sentinel/resilience-banner"
 import { MetricsRibbon } from "@/components/sentinel/metrics-ribbon"
 import { TopologyMap } from "@/components/sentinel/topology-map"
 import { PredictionTimeline } from "@/components/sentinel/prediction-timeline"
@@ -15,6 +16,7 @@ export default function Page() {
     selected,
     setSelected,
     injectFault,
+    injectTransient,
     remediate,
     togglePass,
     toggleAirGap,
@@ -35,10 +37,13 @@ export default function Page() {
           running={running}
           faultActive={!!snap.event}
           onInject={injectFault}
+          onInjectTransient={injectTransient}
           onTogglePass={togglePass}
           onToggleAirGap={toggleAirGap}
           onToggleRunning={toggleRunning}
         />
+
+        {snap.airGapped && <ResilienceBanner running={running} />}
 
         <MetricsRibbon metrics={snap.metrics} />
 
@@ -50,6 +55,8 @@ export default function Page() {
                 frame={snap.frame}
                 event={snap.event}
                 selected={selected}
+                passActive={snap.passActive}
+                rerouted={!!snap.recovery?.rerouted}
                 onSelect={setSelected}
               />
             </div>
@@ -70,6 +77,7 @@ export default function Page() {
               <CopilotPanel
                 event={snap.event}
                 copilot={snap.copilot}
+                recovery={snap.recovery}
                 airGapped={snap.airGapped}
                 onRemediate={remediate}
               />
