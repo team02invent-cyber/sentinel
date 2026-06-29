@@ -1,12 +1,19 @@
 /**
  * SENTINEL — Telemetry Simulator + Fault-Injection + Prediction State Machine
  * ===========================================================================
- * Emits TelemetryFrame v1.0 at 1 sim-Hz, injects one of three fault classes,
- * and runs the prediction lifecycle:
+ * Emits TelemetryFrame v1.0 at 1 sim-Hz, injects one of three fault classes
+ * (plus benign transients), and runs the prediction lifecycle:
  *
  *   healthy -> (fault injected) -> degrading[prediction emitted] ->
  *   imminent -> { remediated -> recovering -> healthy }
  *                { not remediated -> failed -> recovering -> healthy }
+ *
+ *   healthy -> (benign transient) -> degrading[low-confidence] ->
+ *   escalate -> auto-clear[false alarm]
+ *
+ * During the recovering window the deep-space pass LSP is switched onto its
+ * protect path (PROTECT_LSP_PATH) and the degraded element taper-heals back
+ * to nominal — the visible "acted before impact" payoff.
  *
  * ARCHITECTURAL LAW: this module is the "ML predicts" plane. It produces a
  * PredictionEvent. The Copilot (LLM) only explains that event.
@@ -35,6 +42,9 @@ const HISTORY = 120 // seconds of rolling history
 const PASS_MBPS = 800
 const BASE_MBPS = 200
 const DETECT_FRACTION = 0.18 // prediction fires this far into the ramp
+const RECOVERY_S = 9 // visible post-remediation recovery window (sim-seconds)
+const BENIGN_RESOLVE = 0.72 // benign transients auto-clear at this ramp fraction
+const BENIGN_CONF_CAP = 0.53 // below the 0.55 grounding floor -> escalation
 
 /** Which element each fault class targets in the demo. */
 const FAULT_TARGET: Record<FaultClass, { element: string; kind: "node" | "link" }> = {
@@ -52,6 +62,8 @@ interface ActiveFault {
   detected: boolean
   impacted: boolean
   eventId: string
+  /** Benign transient: a glitch the detector should NOT confidently ground. */
+  benign: boolean
 }
 
 /** Visible post-remediation recovery window (the "money-shot"). */
@@ -68,6 +80,11 @@ export interface RecoveryState {
   prevented: boolean
   /** True if the pass LSP was switched onto the protect path. */
   rerouted: boolean
+  /** Ramp progress captured at the moment recovery began (for taper-heal). */
+  progressAtEnd: number
+  /** Carried through for the resolved event-log row. */
+  leadTimeS: number
+  confidence: number
 }
 
 function clamp(v: number, lo: number, hi: number) {
@@ -89,6 +106,7 @@ export class SentinelEngine {
   private active: ActiveFault | null = null
   event: PredictionEvent | null = null
   eventLog: PredictionEvent[] = []
+  recovery: RecoveryState | null = null
 
   metrics: SessionMetrics = {
     injectedFaults: 0,
@@ -108,11 +126,16 @@ export class SentinelEngine {
     for (const l of LINKS) this.linkHist[l.id] = []
   }
 
+  /** The pass path that is live right now (protect path during a reroute). */
+  private activePassPath(): string[] {
+    return this.recovery?.rerouted ? PROTECT_LSP_PATH : PRIMARY_LSP_PATH
+  }
+
   /** Throughput a node carries given pass state and its role on the path. */
   private nodeLoadMbps(id: string): number {
-    const onPrimary = PRIMARY_LSP_PATH.includes(id)
+    const onPath = this.activePassPath().includes(id)
     const base = BASE_MBPS + noise(15)
-    if (this.passActive && onPrimary) return base + PASS_MBPS + noise(40)
+    if (this.passActive && onPath) return base + PASS_MBPS + noise(40)
     if (this.passActive) return base + 120 + noise(30)
     return base
   }
@@ -139,9 +162,9 @@ export class SentinelEngine {
 
   private buildLinkMetrics(id: string): LinkMetrics {
     const link = LINKS.find((l) => l.id === id)!
-    const onPrimary =
-      PRIMARY_LSP_PATH.includes(link.a) && PRIMARY_LSP_PATH.includes(link.b)
-    let util = (this.passActive && onPrimary ? 78 : this.passActive ? 35 : 22) + noise(5)
+    const path = this.activePassPath()
+    const onPath = path.includes(link.a) && path.includes(link.b)
+    const util = (this.passActive && onPath ? 78 : this.passActive ? 35 : 22) + noise(5)
     const lm: LinkMetrics = {
       utilizationPct: clamp(util, 0, 100),
       up: 1,
@@ -157,11 +180,49 @@ export class SentinelEngine {
     return (this.t - this.active.startT) / this.active.leadTimeS
   }
 
-  private applyFaultToNode(id: string, m: NodeMetrics) {
+  private recoveryProgress(): number {
+    if (!this.recovery) return 1
+    return clamp((this.t - this.recovery.startT) / this.recovery.durationS, 0, 1)
+  }
+
+  /**
+   * Effective fault intensity to apply to a node, considering both the active
+   * ramp and the taper-heal during a recovery window. Returns null if the node
+   * is unaffected.
+   */
+  private nodeFaultContext(
+    id: string,
+  ): { cls: FaultClass; intensity: number; benign: boolean } | null {
     const f = this.active
-    if (!f || f.kind !== "node" || f.element !== id) return
-    const p = clamp(this.faultProgress(), 0, 1.6)
-    if (f.faultClass === "ldp_instability") {
+    if (f && f.kind === "node" && f.element === id) {
+      let intensity = clamp(this.faultProgress(), 0, 1.6)
+      if (f.benign) intensity = Math.min(intensity, 0.7) * 0.4 // mild, never impacts
+      return { cls: f.faultClass, intensity, benign: f.benign }
+    }
+    const r = this.recovery
+    if (r && r.kind === "node" && r.element === id) {
+      return { cls: r.faultClass, intensity: r.progressAtEnd * (1 - this.recoveryProgress()), benign: false }
+    }
+    return null
+  }
+
+  private linkFaultContext(id: string): { cls: FaultClass; intensity: number } | null {
+    const f = this.active
+    if (f && f.kind === "link" && f.element === id && !f.benign) {
+      return { cls: f.faultClass, intensity: clamp(this.faultProgress(), 0, 1.6) }
+    }
+    const r = this.recovery
+    if (r && r.kind === "link" && r.element === id) {
+      return { cls: r.faultClass, intensity: r.progressAtEnd * (1 - this.recoveryProgress()) }
+    }
+    return null
+  }
+
+  private applyFaultToNode(id: string, m: NodeMetrics) {
+    const ctx = this.nodeFaultContext(id)
+    if (!ctx) return
+    const p = ctx.intensity
+    if (ctx.cls === "ldp_instability") {
       m.labelChurnPerS = clamp(0.3 + p * 120 + noise(8), 0, 400)
       m.jitterMs = clamp(1.2 + p * 60 + noise(4), 0, 300)
       m.cpuPct = clamp(m.cpuPct + p * 45, 0, 100)
@@ -169,7 +230,7 @@ export class SentinelEngine {
         m.ldpUp = Math.random() < 0.6 ? 0 : 1 // flapping
         m.lspUp = m.ldpUp
       }
-    } else if (f.faultClass === "congestion") {
+    } else if (ctx.cls === "congestion") {
       m.queueDepthPct = clamp(m.queueDepthPct + p * 78 + noise(5), 0, 100)
       m.outMbps = clamp(m.outMbps + p * 150, 0, 1000)
       if (p >= 1) {
@@ -180,20 +241,24 @@ export class SentinelEngine {
   }
 
   private applyFaultToLink(id: string, lm: LinkMetrics) {
-    const f = this.active
-    if (!f || f.kind !== "link" || f.element !== id) return
-    const p = clamp(this.faultProgress(), 0, 1.6)
-    if (f.faultClass === "link_flap") {
-      lm.errorRatePct = clamp(0.02 + p * p * 4.5 + noise(0.1), 0, 100)
-      if (p >= 1) {
-        lm.up = 0
-        lm.utilizationPct = 0
-      }
+    const ctx = this.linkFaultContext(id)
+    if (!ctx || ctx.cls !== "link_flap") return
+    const p = ctx.intensity
+    lm.errorRatePct = clamp(0.02 + p * p * 4.5 + noise(0.1), 0, 100)
+    if (p >= 1) {
+      lm.up = 0
+      lm.utilizationPct = 0
     }
   }
 
   /** Run the prediction state machine after a frame is built. */
   private runPrediction(frame: TelemetryFrame) {
+    // A recovery window owns the event surface until it completes.
+    if (this.recovery) {
+      this.stepRecovery(frame)
+      return
+    }
+
     const f = this.active
     if (!f) {
       this.event = null
@@ -206,10 +271,12 @@ export class SentinelEngine {
     // Detection: fire once the ramp crosses the detection fraction.
     if (!f.detected && p >= DETECT_FRACTION) {
       f.detected = true
-      const leadTimeS = Math.max(0, +(ttiTotal * (1 - p)).toFixed(1))
-      this.metrics.truePositives += 1
-      this.metrics.leadTimesS.push(leadTimeS)
-      this.recomputeMetrics()
+      if (!f.benign) {
+        const leadTimeS = Math.max(0, +(ttiTotal * (1 - p)).toFixed(1))
+        this.metrics.truePositives += 1
+        this.metrics.leadTimesS.push(leadTimeS)
+        this.recomputeMetrics()
+      }
     }
 
     if (!f.detected) {
@@ -217,8 +284,31 @@ export class SentinelEngine {
       return
     }
 
+    // Benign transient: low confidence, never reaches impact, auto-clears
+    // as a false alarm (the Copilot escalates instead of advising).
+    if (f.benign) {
+      const confidence = clamp(0.4 + p * 0.12, 0, BENIGN_CONF_CAP)
+      this.event = {
+        schemaVersion: PREDICTION_SCHEMA_VERSION,
+        modelVersion: MODEL_VERSION,
+        id: f.eventId,
+        element: f.element,
+        elementKind: f.kind,
+        faultClass: f.faultClass,
+        probabilities: this.buildProbabilities(f.faultClass, p, true),
+        timeToImpactS: Math.max(timeToImpactS, 0),
+        leadTimeS: this.event?.leadTimeS ?? timeToImpactS,
+        confidence,
+        phase: "degrading",
+        evidence: this.buildEvidence(f.faultClass, frame, f.element),
+        createdAt: this.event?.createdAt ?? frame.ts,
+      }
+      if (p >= BENIGN_RESOLVE) this.resolveFalseAlarm()
+      return
+    }
+
     const confidence = clamp(0.5 + p * 0.55, 0, 0.99)
-    const probabilities = this.buildProbabilities(f.faultClass, p)
+    const probabilities = this.buildProbabilities(f.faultClass, p, false)
     let phase: PredictionEvent["phase"] = "degrading"
     if (p >= 1) {
       phase = "failed"
@@ -245,13 +335,62 @@ export class SentinelEngine {
       createdAt: this.event?.createdAt ?? frame.ts,
     }
 
-    // Auto-resolve a failed (un-remediated) fault after protect-path kicks in.
-    if (f.impacted && p >= 1.5) {
-      this.finishFault(false)
+    // Un-remediated fault: protect-path automatically kicks in after impact.
+    if (f.impacted && p >= 1.4) {
+      this.beginRecovery(false)
     }
   }
 
-  private buildProbabilities(cls: FaultClass, p: number): Record<FaultClass, number> {
+  /** Drive the recovering event surface and finalize when the window closes. */
+  private stepRecovery(frame: TelemetryFrame) {
+    const r = this.recovery!
+    const recProg = this.recoveryProgress()
+    const evidence = this.buildEvidence(r.faultClass, frame, r.element).map((e) => ({
+      ...e,
+      trend: "falling" as const,
+    }))
+
+    this.event = {
+      schemaVersion: PREDICTION_SCHEMA_VERSION,
+      modelVersion: MODEL_VERSION,
+      id: r.eventId,
+      element: r.element,
+      elementKind: r.kind,
+      faultClass: r.faultClass,
+      probabilities: this.buildProbabilities(r.faultClass, 1 - recProg, false),
+      timeToImpactS: 0,
+      leadTimeS: r.leadTimeS,
+      confidence: r.confidence,
+      phase: "recovering",
+      evidence,
+      createdAt: frame.ts,
+      remediatedAt: Date.now(),
+      outcome: r.prevented ? "prevented" : "impacted",
+    }
+
+    if (recProg >= 1) {
+      this.pushResolved(r)
+      this.recovery = null
+      this.event = null
+      this.recomputeMetrics()
+    }
+  }
+
+  private buildProbabilities(cls: FaultClass, p: number, benign: boolean): Record<FaultClass, number> {
+    if (benign) {
+      // No clear winner — this is what "insufficient grounding" looks like.
+      const jitter = () => 0.33 + noise(0.05)
+      const base: Record<FaultClass, number> = {
+        link_flap: jitter(),
+        ldp_instability: jitter(),
+        congestion: jitter(),
+      }
+      const sum = base.link_flap + base.ldp_instability + base.congestion
+      base.link_flap /= sum
+      base.ldp_instability /= sum
+      base.congestion /= sum
+      return base
+    }
     const hi = clamp(0.45 + p * 0.5, 0, 0.98)
     const rest = (1 - hi) / 2
     const base: Record<FaultClass, number> = {
@@ -334,7 +473,7 @@ export class SentinelEngine {
   }
 
   injectFault(faultClass: FaultClass) {
-    if (this.active) return // one fault at a time in the demo
+    if (this.active || this.recovery) return // one scenario at a time in the demo
     const target = FAULT_TARGET[faultClass]
     this.active = {
       faultClass,
@@ -345,37 +484,121 @@ export class SentinelEngine {
       detected: false,
       impacted: false,
       eventId: `EVT-${Date.now().toString(36).toUpperCase()}`,
+      benign: false,
     }
     this.metrics.injectedFaults += 1
     this.recomputeMetrics()
   }
 
+  /**
+   * Inject a benign transient: a brief glitch that trips detection at low
+   * confidence. The Copilot escalates (no grounded advice), it self-clears
+   * without impact, and it counts as a false alarm. Exercises the FAR metric
+   * and the anti-hallucination escalation path.
+   */
+  injectTransient() {
+    if (this.active || this.recovery) return
+    this.active = {
+      faultClass: "ldp_instability",
+      element: "P2",
+      kind: "node",
+      startT: this.t,
+      leadTimeS: 30 + Math.round(Math.random() * 15),
+      detected: false,
+      impacted: false,
+      eventId: `EVT-${Date.now().toString(36).toUpperCase()}`,
+      benign: true,
+    }
+    // NOTE: not counted in injectedFaults — there is no real fault to detect.
+  }
+
   /** Operator applies the recommended remediation before impact. */
   remediate() {
     const f = this.active
-    if (!f || !this.event) return
-    if (!f.impacted) {
-      // prevented: estimate packets saved over the avoided exposure window
-      const exposureS = Math.max(this.event.timeToImpactS, 5)
-      const pps = (this.passActive ? PASS_MBPS : BASE_MBPS) * 1e6 / (1500 * 8)
-      this.metrics.packetsLossPrevented += Math.round(pps * exposureS)
-    }
-    this.finishFault(true)
+    if (!f || f.benign || !this.event) return
+    this.beginRecovery(!f.impacted)
   }
 
-  private finishFault(prevented: boolean) {
-    if (this.event) {
-      const resolved: PredictionEvent = {
-        ...this.event,
-        phase: "recovering",
-        remediatedAt: Date.now(),
-      }
-      this.eventLog.unshift(resolved)
-      if (this.eventLog.length > 8) this.eventLog.pop()
+  /** Estimate packets of loss avoided over the exposure window. */
+  private estimatePrevented(): number {
+    const exposureS = Math.max(this.event?.timeToImpactS ?? 0, 5)
+    const pps = ((this.passActive ? PASS_MBPS : BASE_MBPS) * 1e6) / (1500 * 8)
+    return Math.round(pps * exposureS)
+  }
+
+  /** Transition the active fault into a visible recovery window. */
+  private beginRecovery(prevented: boolean) {
+    const f = this.active
+    if (!f) return
+    const packetsPrevented = prevented ? this.estimatePrevented() : 0
+    if (prevented) this.metrics.packetsLossPrevented += packetsPrevented
+
+    this.recovery = {
+      eventId: f.eventId,
+      element: f.element,
+      kind: f.kind,
+      faultClass: f.faultClass,
+      startT: this.t,
+      durationS: RECOVERY_S,
+      packetsPrevented,
+      prevented,
+      // Congestion is mitigated in place via QoS; the others reroute traffic.
+      rerouted: f.faultClass !== "congestion",
+      progressAtEnd: clamp(this.faultProgress(), 0, 1.6),
+      leadTimeS: this.event?.leadTimeS ?? 0,
+      confidence: this.event?.confidence ?? 0,
     }
+    this.active = null
+    this.recomputeMetrics()
+  }
+
+  /** Benign transient self-clears as a false alarm. */
+  private resolveFalseAlarm() {
+    const f = this.active
+    if (!f) return
+    this.metrics.falseAlarms += 1
+    this.eventLog.unshift({
+      schemaVersion: PREDICTION_SCHEMA_VERSION,
+      modelVersion: MODEL_VERSION,
+      id: f.eventId,
+      element: f.element,
+      elementKind: f.kind,
+      faultClass: f.faultClass,
+      probabilities: this.buildProbabilities(f.faultClass, 0, true),
+      timeToImpactS: 0,
+      leadTimeS: 0,
+      confidence: BENIGN_CONF_CAP,
+      phase: "healthy",
+      evidence: [],
+      createdAt: Date.now(),
+      remediatedAt: Date.now(),
+      outcome: "false_alarm",
+    })
+    if (this.eventLog.length > 8) this.eventLog.pop()
     this.active = null
     this.event = null
     this.recomputeMetrics()
+  }
+
+  private pushResolved(r: RecoveryState) {
+    this.eventLog.unshift({
+      schemaVersion: PREDICTION_SCHEMA_VERSION,
+      modelVersion: MODEL_VERSION,
+      id: r.eventId,
+      element: r.element,
+      elementKind: r.kind,
+      faultClass: r.faultClass,
+      probabilities: this.buildProbabilities(r.faultClass, 1, false),
+      timeToImpactS: 0,
+      leadTimeS: r.leadTimeS,
+      confidence: r.confidence,
+      phase: "recovering",
+      evidence: [],
+      createdAt: Date.now(),
+      remediatedAt: Date.now(),
+      outcome: r.prevented ? "prevented" : "impacted",
+    })
+    if (this.eventLog.length > 8) this.eventLog.pop()
   }
 
   setPass(on: boolean) {

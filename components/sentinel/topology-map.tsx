@@ -1,6 +1,6 @@
 "use client"
 
-import { LINKS, NODES, NODE_BY_ID } from "@/lib/sentinel/topology"
+import { LINKS, NODES, NODE_BY_ID, LINK_BY_ID, PRIMARY_LSP_PATH, PROTECT_LSP_PATH } from "@/lib/sentinel/topology"
 import { HEALTH_COLOR, linkHealth, nodeHealth } from "@/lib/sentinel/health"
 import type { PredictionEvent, TelemetryFrame } from "@/lib/sentinel/schema"
 
@@ -8,20 +8,42 @@ interface Props {
   frame: TelemetryFrame | null
   event: PredictionEvent | null
   selected: string | null
+  passActive: boolean
+  rerouted: boolean
   onSelect: (id: string) => void
 }
 
-export function TopologyMap({ frame, event, selected, onSelect }: Props) {
+/** Resolve the link record connecting two adjacent path nodes (either order). */
+function pathLink(a: string, b: string) {
+  return LINK_BY_ID[`${a}-${b}`] ?? LINK_BY_ID[`${b}-${a}`] ?? null
+}
+
+export function TopologyMap({ frame, event, selected, passActive, rerouted, onSelect }: Props) {
+  const passPath = rerouted ? PROTECT_LSP_PATH : PRIMARY_LSP_PATH
+  // Segments of the live pass LSP, drawn as a highlighted underlay.
+  const passSegments = (passActive || rerouted)
+    ? passPath
+        .slice(0, -1)
+        .map((id, i) => pathLink(id, passPath[i + 1]))
+        .filter((l): l is NonNullable<typeof l> => !!l)
+    : []
+
   return (
     <div className="relative h-full w-full overflow-hidden rounded-lg border border-border bg-card">
       <div className="absolute left-3 top-3 z-10 flex items-center gap-2 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
         <span className="text-foreground">MPLS Core Fabric</span>
         <span>· 7 nodes · 9 links</span>
+        {rerouted && (
+          <span className="rounded border border-[color:var(--info)] px-1.5 py-0.5 text-[color:var(--info)]">
+            Pass on protect path
+          </span>
+        )}
       </div>
       <div className="absolute right-3 top-3 z-10 flex items-center gap-3 font-mono text-[10px] uppercase tracking-widest">
         <Legend color="var(--ok)" label="Nominal" />
         <Legend color="var(--warn)" label="Predicted" />
         <Legend color="var(--crit)" label="Impact" />
+        {(passActive || rerouted) && <Legend color="var(--primary)" label="Pass LSP" />}
       </div>
 
       <svg viewBox="0 0 1000 640" className="h-full w-full" preserveAspectRatio="xMidYMid meet">
@@ -32,6 +54,26 @@ export function TopologyMap({ frame, event, selected, onSelect }: Props) {
           </pattern>
         </defs>
         <rect x="0" y="0" width="1000" height="640" fill="url(#grid)" />
+
+        {/* live pass-LSP underlay (primary, or protect path during a reroute) */}
+        {passSegments.map((l) => {
+          const a = NODE_BY_ID[l.a]
+          const b = NODE_BY_ID[l.b]
+          return (
+            <line
+              key={`pass-${l.id}`}
+              x1={a.x}
+              y1={a.y}
+              x2={b.x}
+              y2={b.y}
+              stroke={rerouted ? "var(--info)" : "var(--primary)"}
+              strokeWidth={9}
+              strokeOpacity={0.18}
+              strokeLinecap="round"
+              className={rerouted ? "animate-sentinel-pulse" : undefined}
+            />
+          )
+        })}
 
         {/* links */}
         {LINKS.map((l) => {

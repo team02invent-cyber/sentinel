@@ -10,6 +10,7 @@ interface Props {
   running: boolean
   faultActive: boolean
   onInject: (cls: FaultClass) => void
+  onInjectTransient: () => void
   onTogglePass: () => void
   onToggleAirGap: () => void
   onToggleRunning: () => void
@@ -27,6 +28,7 @@ export function ControlDeck({
   running,
   faultActive,
   onInject,
+  onInjectTransient,
   onTogglePass,
   onToggleAirGap,
   onToggleRunning,
@@ -49,6 +51,17 @@ export function ControlDeck({
           {f.label}
         </Button>
       ))}
+
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={faultActive}
+        onClick={onInjectTransient}
+        className="font-mono text-[11px] text-muted-foreground"
+        title="Benign glitch: low-confidence anomaly the Copilot escalates instead of advising"
+      >
+        Inject Transient
+      </Button>
 
       <div className="mx-1 h-5 w-px bg-border" />
 

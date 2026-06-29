@@ -1,19 +1,22 @@
 "use client"
 
-import { ShieldCheck, Terminal, TriangleAlert, WifiOff, FileText, Zap } from "lucide-react"
+import { ShieldCheck, Terminal, TriangleAlert, WifiOff, FileText, Zap, Route, CheckCircle2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { corpusTitle } from "@/lib/sentinel/copilot"
 import { FAULT_LABELS } from "@/lib/sentinel/schema"
+import { PROTECT_LSP_PATH } from "@/lib/sentinel/topology"
 import type { CopilotResponse, PredictionEvent } from "@/lib/sentinel/schema"
+import type { RecoveryState } from "@/lib/sentinel/simulator"
 
 interface Props {
   event: PredictionEvent | null
   copilot: CopilotResponse | null
+  recovery: RecoveryState | null
   airGapped: boolean
   onRemediate: () => void
 }
 
-export function CopilotPanel({ event, copilot, airGapped, onRemediate }: Props) {
+export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate }: Props) {
   const active = event && copilot && (event.phase === "degrading" || event.phase === "imminent")
 
   return (
@@ -38,7 +41,9 @@ export function CopilotPanel({ event, copilot, airGapped, onRemediate }: Props) 
       </div>
 
       <div className="flex-1 overflow-y-auto p-4">
-        {!active ? (
+        {recovery ? (
+          <RecoverySuccess recovery={recovery} />
+        ) : !active ? (
           <IdleState airGapped={airGapped} />
         ) : copilot.grounded ? (
           <GroundedAdvice event={event} copilot={copilot} />
@@ -51,12 +56,12 @@ export function CopilotPanel({ event, copilot, airGapped, onRemediate }: Props) 
       <div className="border-t border-border p-3">
         <Button
           className="w-full font-mono text-xs uppercase tracking-widest"
-          disabled={!active || !copilot?.grounded}
+          disabled={!active || !copilot?.grounded || !!recovery}
           onClick={onRemediate}
-          style={{ background: active ? "var(--ok)" : undefined, color: active ? "var(--ok-foreground)" : undefined }}
+          style={{ background: active && !recovery ? "var(--ok)" : undefined, color: active && !recovery ? "var(--ok-foreground)" : undefined }}
         >
           <Terminal className="size-4" />
-          Apply Remediation
+          {recovery ? "Remediation Applied" : "Apply Remediation"}
         </Button>
       </div>
     </div>
@@ -78,6 +83,71 @@ function IdleState({ airGapped }: { airGapped: boolean }) {
       )}
     </div>
   )
+}
+
+function RecoverySuccess({ recovery }: { recovery: RecoveryState }) {
+  const prevented = recovery.prevented
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center gap-2" style={{ color: prevented ? "var(--ok)" : "var(--info)" }}>
+        <CheckCircle2 className="size-5" />
+        <span className="font-mono text-xs font-semibold uppercase tracking-widest">
+          {prevented ? "Failure averted" : "Service restored"}
+        </span>
+      </div>
+
+      <p className="font-mono text-xs leading-relaxed text-foreground">
+        {prevented
+          ? `Remediation landed before impact on ${recovery.element}. No pass telemetry was lost.`
+          : `${recovery.element} took impact; the protect path absorbed traffic and the element is recovering.`}
+      </p>
+
+      {recovery.rerouted && (
+        <div className="rounded border border-border bg-secondary/30 px-2.5 py-2">
+          <div className="flex items-center gap-1.5 font-mono text-[10px] font-semibold uppercase tracking-widest text-primary">
+            <Route className="size-3.5" />
+            Pass LSP rerouted
+          </div>
+          <p className="mt-1 font-mono text-[11px] text-muted-foreground">
+            {PROTECT_LSP_PATH.join(" → ")}
+          </p>
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-px overflow-hidden rounded border border-border bg-border">
+        <div className="flex flex-col gap-0.5 bg-card px-3 py-2">
+          <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            Loss prevented
+          </span>
+          <span className="font-mono text-lg font-semibold tabular-nums" style={{ color: "var(--ok)" }}>
+            {formatPkts(recovery.packetsPrevented)}
+          </span>
+          <span className="font-mono text-[10px] text-muted-foreground">packets</span>
+        </div>
+        <div className="flex flex-col gap-0.5 bg-card px-3 py-2">
+          <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            Lead time
+          </span>
+          <span className="font-mono text-lg font-semibold tabular-nums text-foreground">
+            {recovery.leadTimeS.toFixed(0)}s
+          </span>
+          <span className="font-mono text-[10px] text-muted-foreground">before impact</span>
+        </div>
+      </div>
+
+      <p className="font-mono text-[10px] leading-relaxed text-muted-foreground">
+        Element is taper-healing to nominal. The Copilot will return to idle when
+        recovery completes.
+      </p>
+    </div>
+  )
+}
+
+function formatPkts(n: number): string {
+  if (n === 0) return "0"
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`
+  return `${n}`
 }
 
 function EscalationState({ copilot }: { copilot: CopilotResponse }) {

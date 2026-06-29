@@ -123,6 +123,8 @@ export interface PredictionEvent {
   evidence: EvidenceRow[]
   createdAt: number // epoch ms
   remediatedAt?: number
+  /** Final disposition for the event log (additive, optional). */
+  outcome?: "prevented" | "false_alarm" | "impacted"
 }
 
 export interface EvidenceRow {
