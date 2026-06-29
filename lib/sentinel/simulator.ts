@@ -37,14 +37,14 @@ import {
   type TelemetryFrame,
 } from "./schema"
 import { LINKS, NODES, PRIMARY_LSP_PATH, PROTECT_LSP_PATH } from "./topology"
+import { Detector, type DetectorVerdict } from "./detector"
 
 const HISTORY = 120 // seconds of rolling history
 const PASS_MBPS = 800
 const BASE_MBPS = 200
-const DETECT_FRACTION = 0.18 // prediction fires this far into the ramp
 const RECOVERY_S = 9 // visible post-remediation recovery window (sim-seconds)
 const BENIGN_RESOLVE = 0.72 // benign transients auto-clear at this ramp fraction
-const BENIGN_CONF_CAP = 0.53 // below the 0.55 grounding floor -> escalation
+const BENIGN_CONF_CAP = 0.53 // ceiling recorded for a resolved false-alarm row
 
 /** Which element each fault class targets in the demo. */
 const FAULT_TARGET: Record<FaultClass, { element: string; kind: "node" | "link" }> = {
