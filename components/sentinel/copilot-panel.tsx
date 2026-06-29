@@ -1,7 +1,21 @@
 "use client"
 
-import { ShieldCheck, Terminal, TriangleAlert, WifiOff, FileText, Zap, Route, CheckCircle2 } from "lucide-react"
+import { useRef, useState } from "react"
+import {
+  ShieldCheck,
+  Terminal,
+  TriangleAlert,
+  WifiOff,
+  FileText,
+  Zap,
+  Route,
+  CheckCircle2,
+  Cpu,
+  Send,
+  Loader2,
+} from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { corpusTitle } from "@/lib/sentinel/copilot"
 import { FAULT_LABELS } from "@/lib/sentinel/schema"
 import { PROTECT_LSP_PATH } from "@/lib/sentinel/topology"
@@ -14,10 +28,35 @@ interface Props {
   recovery: RecoveryState | null
   airGapped: boolean
   onRemediate: () => void
+  onQuery: (q: string) => Promise<CopilotResponse>
 }
 
-export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate }: Props) {
+export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate, onQuery }: Props) {
   const active = event && copilot && (event.phase === "degrading" || event.phase === "imminent")
+  const [query, setQuery] = useState("")
+  const [queryResult, setQueryResult] = useState<CopilotResponse | null>(null)
+  const [querying, setQuerying] = useState(false)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  async function handleQuery() {
+    const q = query.trim()
+    if (!q) return
+    setQuerying(true)
+    setQueryResult(null)
+    try {
+      const result = await onQuery(q)
+      setQueryResult(result)
+    } finally {
+      setQuerying(false)
+    }
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter") handleQuery()
+  }
+
+  // If there is an active event, show event response. If query result exists and no active event, show query result.
+  const displayResponse = event ? copilot : queryResult
 
   return (
     <div className="flex h-full flex-col rounded-lg border border-border bg-card">
@@ -29,9 +68,17 @@ export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate 
             Sentinel Copilot
           </span>
         </div>
-        <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-widest">
-          <WifiOff className="size-3 text-[color:var(--ok)]" />
-          <span className="text-[color:var(--ok)]">Offline · on-prem LLM</span>
+        <div className="flex items-center gap-3">
+          {copilot?.fromLLM && (
+            <div className="flex items-center gap-1 font-mono text-[10px] text-[color:var(--ok)]">
+              <Cpu className="size-3" />
+              <span>Mistral · {copilot.inferenceMs?.toFixed(0)}ms</span>
+            </div>
+          )}
+          <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-widest">
+            <WifiOff className="size-3 text-[color:var(--ok)]" />
+            <span className="text-[color:var(--ok)]">Offline · on-prem LLM</span>
+          </div>
         </div>
       </div>
 
@@ -40,15 +87,42 @@ export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate 
         ML predicts · LLM explains · every claim cited
       </div>
 
+      {/* free-text NOC query bar */}
+      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+        <Input
+          ref={inputRef}
+          className="h-7 flex-1 font-mono text-[11px] placeholder:text-muted-foreground/50"
+          placeholder="Ask a question about this network (e.g. 'how do I dampen BGP flaps?')"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={handleKeyDown}
+          disabled={querying}
+        />
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 px-2"
+          onClick={handleQuery}
+          disabled={querying || !query.trim()}
+          title="Ask the Copilot"
+        >
+          {querying ? <Loader2 className="size-3 animate-spin" /> : <Send className="size-3" />}
+        </Button>
+      </div>
+
       <div className="flex-1 overflow-y-auto p-4">
         {recovery ? (
           <RecoverySuccess recovery={recovery} />
-        ) : !active ? (
+        ) : !displayResponse ? (
           <IdleState airGapped={airGapped} />
-        ) : copilot.grounded ? (
+        ) : queryResult && !event ? (
+          <QueryAnswer result={queryResult} />
+        ) : active && copilot?.grounded ? (
           <GroundedAdvice event={event} copilot={copilot} />
+        ) : displayResponse && !displayResponse.grounded ? (
+          <EscalationState copilot={displayResponse} />
         ) : (
-          <EscalationState copilot={copilot} />
+          <IdleState airGapped={airGapped} />
         )}
       </div>
 
@@ -58,7 +132,10 @@ export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate 
           className="w-full font-mono text-xs uppercase tracking-widest"
           disabled={!active || !copilot?.grounded || !!recovery}
           onClick={onRemediate}
-          style={{ background: active && !recovery ? "var(--ok)" : undefined, color: active && !recovery ? "var(--ok-foreground)" : undefined }}
+          style={{
+            background: active && !recovery ? "var(--ok)" : undefined,
+            color: active && !recovery ? "var(--ok-foreground)" : undefined,
+          }}
         >
           <Terminal className="size-4" />
           {recovery ? "Remediation Applied" : "Apply Remediation"}
@@ -68,13 +145,17 @@ export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate 
   )
 }
 
+/* ------------------------------------------------------------------ */
+/* Sub-views                                                           */
+/* ------------------------------------------------------------------ */
+
 function IdleState({ airGapped }: { airGapped: boolean }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
       <ShieldCheck className="size-8 text-[color:var(--ok)]" />
       <p className="font-mono text-xs text-muted-foreground">
-        No active prediction. Copilot is idle and waiting for an event from the
-        prediction plane.
+        No active prediction. Copilot is idle. Use the query bar above to ask
+        any question about the network, runbooks, or past incidents.
       </p>
       {airGapped && (
         <p className="font-mono text-[10px] text-[color:var(--ok)]">
@@ -85,11 +166,42 @@ function IdleState({ airGapped }: { airGapped: boolean }) {
   )
 }
 
+function QueryAnswer({ result }: { result: CopilotResponse }) {
+  return (
+    <div className="flex flex-col gap-4">
+      {result.answeredQuery && (
+        <div className="rounded border border-primary/20 bg-primary/5 px-3 py-2">
+          <span className="font-mono text-[10px] font-semibold uppercase tracking-widest text-primary">Query</span>
+          <p className="mt-1 font-mono text-xs text-foreground">{result.answeredQuery}</p>
+        </div>
+      )}
+      {result.fromLLM && (
+        <div className="flex items-center gap-1.5 font-mono text-[10px] text-[color:var(--ok)]">
+          <Cpu className="size-3" />
+          LLM response · {result.inferenceMs?.toFixed(0)}ms
+        </div>
+      )}
+      <Section title="Answer" body={result.summary.text} source={result.summary.source} />
+      {result.rootCause.text && result.rootCause.text !== result.summary.text && (
+        <Section title="Context" body={result.rootCause.text} source={result.rootCause.source} />
+      )}
+      {!result.grounded && result.escalation && (
+        <div className="rounded border border-[color:var(--warn)]/30 bg-[color:var(--warn)]/5 px-3 py-2 font-mono text-[11px] text-[color:var(--warn)]">
+          {result.escalation}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function RecoverySuccess({ recovery }: { recovery: RecoveryState }) {
   const prevented = recovery.prevented
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center gap-2" style={{ color: prevented ? "var(--ok)" : "var(--info)" }}>
+      <div
+        className="flex items-center gap-2"
+        style={{ color: prevented ? "var(--ok)" : "var(--info)" }}
+      >
         <CheckCircle2 className="size-5" />
         <span className="font-mono text-xs font-semibold uppercase tracking-widest">
           {prevented ? "Failure averted" : "Service restored"}
@@ -109,7 +221,7 @@ function RecoverySuccess({ recovery }: { recovery: RecoveryState }) {
             Pass LSP rerouted
           </div>
           <p className="mt-1 font-mono text-[11px] text-muted-foreground">
-            {PROTECT_LSP_PATH.join(" → ")}
+            {PROTECT_LSP_PATH.join(" \u2192 ")}
           </p>
         </div>
       )}
@@ -119,7 +231,10 @@ function RecoverySuccess({ recovery }: { recovery: RecoveryState }) {
           <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
             Loss prevented
           </span>
-          <span className="font-mono text-lg font-semibold tabular-nums" style={{ color: "var(--ok)" }}>
+          <span
+            className="font-mono text-lg font-semibold tabular-nums"
+            style={{ color: "var(--ok)" }}
+          >
             {formatPkts(recovery.packetsPrevented)}
           </span>
           <span className="font-mono text-[10px] text-muted-foreground">packets</span>
@@ -164,7 +279,13 @@ function EscalationState({ copilot }: { copilot: CopilotResponse }) {
   )
 }
 
-function GroundedAdvice({ event, copilot }: { event: PredictionEvent; copilot: CopilotResponse }) {
+function GroundedAdvice({
+  event,
+  copilot,
+}: {
+  event: PredictionEvent
+  copilot: CopilotResponse
+}) {
   return (
     <div className="flex flex-col gap-4">
       {/* fault chip */}
@@ -175,9 +296,17 @@ function GroundedAdvice({ event, copilot }: { event: PredictionEvent; copilot: C
         >
           {FAULT_LABELS[event.faultClass]}
         </span>
-        <span className="font-mono text-[10px] text-muted-foreground">
-          conf {(event.confidence * 100).toFixed(0)}% · {event.modelVersion}
-        </span>
+        <div className="flex flex-col items-end gap-0.5">
+          <span className="font-mono text-[10px] text-muted-foreground">
+            conf {(event.confidence * 100).toFixed(0)}% · {event.modelVersion}
+          </span>
+          {copilot.fromLLM && (
+            <span className="flex items-center gap-1 font-mono text-[10px] text-[color:var(--ok)]">
+              <Cpu className="size-3" />
+              Mistral {copilot.inferenceMs?.toFixed(0)}ms
+            </span>
+          )}
+        </div>
       </div>
 
       <Section title="What" body={copilot.summary.text} source={copilot.summary.source} />
@@ -188,17 +317,37 @@ function GroundedAdvice({ event, copilot }: { event: PredictionEvent; copilot: C
         <SectionLabel>Evidence (summarized, not raw)</SectionLabel>
         <div className="mt-1.5 grid grid-cols-1 gap-1">
           {event.evidence.map((e) => (
-            <div key={e.label} className="flex items-center justify-between rounded border border-border bg-secondary/30 px-2 py-1 font-mono text-[11px]">
+            <div
+              key={e.label}
+              className="flex items-center justify-between rounded border border-border bg-secondary/30 px-2 py-1 font-mono text-[11px]"
+            >
               <span className="text-muted-foreground">{e.label}</span>
               <span className="flex items-center gap-1.5 text-foreground">
                 {e.value}
-                {e.trend === "rising" && <span className="text-[color:var(--crit)]">▲</span>}
-                {e.trend === "falling" && <span className="text-[color:var(--warn)]">▼</span>}
+                {e.trend === "rising" && <span className="text-[color:var(--crit)]">&#9650;</span>}
+                {e.trend === "falling" && <span className="text-[color:var(--warn)]">&#9660;</span>}
               </span>
             </div>
           ))}
         </div>
       </div>
+
+      {/* BGP cascade if present */}
+      {event.cascadeNodes && event.cascadeNodes.length > 0 && (
+        <div>
+          <SectionLabel>BGP cascade — affected nodes</SectionLabel>
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            {event.cascadeNodes.map((n) => (
+              <span
+                key={n}
+                className="rounded border border-[color:var(--crit)]/30 bg-[color:var(--crit)]/5 px-2 py-0.5 font-mono text-[10px] text-[color:var(--crit)]"
+              >
+                {n}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* fix */}
       <div>
@@ -221,7 +370,15 @@ function GroundedAdvice({ event, copilot }: { event: PredictionEvent; copilot: C
   )
 }
 
-function Section({ title, body, source }: { title: string; body: string; source: string }) {
+function Section({
+  title,
+  body,
+  source,
+}: {
+  title: string
+  body: string
+  source: string
+}) {
   return (
     <div>
       <SectionLabel>{title}</SectionLabel>

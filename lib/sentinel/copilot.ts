@@ -21,6 +21,7 @@ import {
   type CopilotRequest,
   type CopilotResponse,
   type FaultClass,
+  type PredictionEvent,
 } from "./schema"
 
 /* ------------------------------------------------------------------ *
