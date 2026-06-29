@@ -1,57 +1,73 @@
 /**
- * SENTINEL — Telemetry Simulator + Fault-Injection + Prediction State Machine
- * ===========================================================================
- * Emits TelemetryFrame v1.0 at 1 sim-Hz, injects one of three fault classes
- * (plus benign transients), and runs the prediction lifecycle:
+ * SENTINEL — Telemetry Simulator v2.0
+ * ====================================
+ * Emits TelemetryFrame v2.0 at 1 sim-Hz. Fault lifecycle:
  *
- *   healthy -> (fault injected) -> degrading[prediction emitted] ->
- *   imminent -> { remediated -> recovering -> healthy }
- *                { not remediated -> failed -> recovering -> healthy }
+ *   healthy -> degrading[prediction emitted] -> imminent ->
+ *   { remediated -> recovering -> healthy }
+ *   { not remediated -> failed -> recovering -> healthy }
  *
- *   healthy -> (benign transient) -> degrading[low-confidence] ->
- *   escalate -> auto-clear[false alarm]
- *
- * During the recovering window the deep-space pass LSP is switched onto its
- * protect path (PROTECT_LSP_PATH) and the degraded element taper-heals back
- * to nominal — the visible "acted before impact" payoff.
- *
- * ARCHITECTURAL LAW: this module is the "ML predicts" plane. It produces a
- * PredictionEvent. The Copilot (LLM) only explains that event.
- *
- * The feed source is swappable: replace tick()'s metric synthesis with a
- * real FRR/gNMI exporter that emits the same TelemetryFrame schema and the
- * rest of the system is unchanged.
+ * NEW in v2.0:
+ *   - EWMA baseline (α=0.15) + rolling 30-sample z-score per metric
+ *   - Two new fault classes: bgp_route_flap, policy_drift
+ *   - BGP route-flap: downstream cascade visualization
+ *   - Policy drift: SD-WAN controller state degradation
+ *   - IKE/rekey tunnel health on every link
+ *   - ECMP path asymmetry detection
+ *   - NetFlow/IPFIX record emitter (every 5s)
+ *   - Syslog event emitter (fault-correlated)
+ *   - gNMI adapter stub (maps real gNMI telemetry to TelemetryFrame)
  */
 
 import {
   FAULT_LABELS,
   MODEL_VERSION,
+  NETFLOW_SCHEMA_VERSION,
   PREDICTION_SCHEMA_VERSION,
+  SYSLOG_SCHEMA_VERSION,
   TELEMETRY_SCHEMA_VERSION,
+  type ControllerAlarm,
+  type ControllerState,
   type EvidenceRow,
   type FaultClass,
   type LinkMetrics,
+  type NetFlowRecord,
   type NodeMetrics,
   type PredictionEvent,
   type SessionMetrics,
+  type SyslogEvent,
   type TelemetryFrame,
 } from "./schema"
 import { LINKS, NODES, PRIMARY_LSP_PATH, PROTECT_LSP_PATH } from "./topology"
 
-const HISTORY = 120 // seconds of rolling history
+/* ------------------------------------------------------------------ *
+ * Constants
+ * ------------------------------------------------------------------ */
+const HISTORY = 120          // seconds of rolling history
 const PASS_MBPS = 800
 const BASE_MBPS = 200
-const DETECT_FRACTION = 0.18 // prediction fires this far into the ramp
-const RECOVERY_S = 9 // visible post-remediation recovery window (sim-seconds)
-const BENIGN_RESOLVE = 0.72 // benign transients auto-clear at this ramp fraction
-const BENIGN_CONF_CAP = 0.53 // below the 0.55 grounding floor -> escalation
+const RECOVERY_S = 9
+const BENIGN_RESOLVE = 0.72
+const BENIGN_CONF_CAP = 0.53
+const NETFLOW_INTERVAL_S = 5 // emit a flow record every N sim-seconds
+
+/* EWMA detector constants */
+const EWMA_ALPHA = 0.15        // smoothing factor
+const ZSCORE_WINDOW = 30       // samples for rolling std-dev
+const ANOMALY_THRESHOLD = 2.5  // z-score magnitude to flag a metric
+const DETECT_ANOMALY_FRAC = 0.18 // anomaly score fraction to fire prediction
 
 /** Which element each fault class targets in the demo. */
 const FAULT_TARGET: Record<FaultClass, { element: string; kind: "node" | "link" }> = {
-  link_flap: { element: "P1-P3", kind: "link" },
-  ldp_instability: { element: "P3", kind: "node" },
-  congestion: { element: "PE2", kind: "node" },
+  link_flap:       { element: "P1-P3",  kind: "link" },
+  ldp_instability: { element: "P3",     kind: "node" },
+  congestion:      { element: "PE2",    kind: "node" },
+  bgp_route_flap:  { element: "PE1",    kind: "node" },
+  policy_drift:    { element: "PE2",    kind: "node" },
 }
+
+/** Nodes that lose reachability when BGP flaps on PE1 */
+const BGP_CASCADE_NODES = ["P1", "P3", "PE2"]
 
 interface ActiveFault {
   faultClass: FaultClass
@@ -62,7 +78,6 @@ interface ActiveFault {
   detected: boolean
   impacted: boolean
   eventId: string
-  /** Benign transient: a glitch the detector should NOT confidently ground. */
   benign: boolean
 }
 
@@ -74,26 +89,67 @@ export interface RecoveryState {
   faultClass: FaultClass
   startT: number
   durationS: number
-  /** Packets that would have dropped, avoided by acting before impact. */
   packetsPrevented: number
-  /** True if remediation landed before any packet loss. */
   prevented: boolean
-  /** True if the pass LSP was switched onto the protect path. */
   rerouted: boolean
-  /** Ramp progress captured at the moment recovery began (for taper-heal). */
   progressAtEnd: number
-  /** Carried through for the resolved event-log row. */
   leadTimeS: number
   confidence: number
+  anomalyScore?: number
 }
 
+/* ------------------------------------------------------------------ *
+ * EWMA Baseline tracker (per-metric, per-element)
+ * ------------------------------------------------------------------ */
+class EWMATracker {
+  private baseline: number | null = null
+  private history: number[] = []
+
+  update(value: number): { ewma: number; zScore: number } {
+    if (this.baseline === null) this.baseline = value
+    this.baseline = EWMA_ALPHA * value + (1 - EWMA_ALPHA) * this.baseline
+    this.history.push(value)
+    if (this.history.length > ZSCORE_WINDOW) this.history.shift()
+
+    const n = this.history.length
+    if (n < 4) return { ewma: this.baseline, zScore: 0 }
+
+    const mean = this.history.reduce((a, b) => a + b, 0) / n
+    const variance = this.history.reduce((a, b) => a + (b - mean) ** 2, 0) / n
+    const std = Math.sqrt(variance) || 1
+    const zScore = (value - mean) / std
+    return { ewma: this.baseline, zScore }
+  }
+
+  reset(value?: number) {
+    this.baseline = value ?? null
+    this.history = []
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Utilities
+ * ------------------------------------------------------------------ */
 function clamp(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v))
 }
 function noise(amp: number) {
   return (Math.random() - 0.5) * 2 * amp
 }
+function randomIp(prefix: string): string {
+  return `${prefix}.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}`
+}
+function pad2(n: number) {
+  return String(n).padStart(2, "0")
+}
+function isoNow(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}Z`
+}
 
+/* ------------------------------------------------------------------ *
+ * SentinelEngine
+ * ------------------------------------------------------------------ */
 export class SentinelEngine {
   t = 0
   passActive = false
@@ -108,6 +164,14 @@ export class SentinelEngine {
   eventLog: PredictionEvent[] = []
   recovery: RecoveryState | null = null
 
+  /** Rolling NetFlow records (last 30) */
+  flowLog: NetFlowRecord[] = []
+  /** Rolling Syslog events (last 50) */
+  syslogLog: SyslogEvent[] = []
+
+  /** Current controller state (updated each tick) */
+  controllerState: ControllerState = this.buildNominalController()
+
   metrics: SessionMetrics = {
     injectedFaults: 0,
     truePositives: 0,
@@ -117,21 +181,83 @@ export class SentinelEngine {
     leadTimesS: [],
     medianLeadTimeS: 0,
     packetsLossPrevented: 0,
-    reactiveMttdS: 180, // design-target reference (representative)
-    reactiveMttrS: 1500, // design-target reference (representative)
+    reactiveMttdS: 180,
+    reactiveMttrS: 1500,
+    anomalyScores: [],
+    meanAnomalyScore: 0,
   }
+
+  /* EWMA trackers: nodeId -> metricKey -> tracker */
+  private ewmaNode: Record<string, Partial<Record<keyof NodeMetrics, EWMATracker>>> = {}
+  private ewmaLink: Record<string, Partial<Record<keyof LinkMetrics, EWMATracker>>> = {}
 
   constructor() {
-    for (const n of NODES) this.nodeHist[n.id] = []
-    for (const l of LINKS) this.linkHist[l.id] = []
+    for (const n of NODES) {
+      this.nodeHist[n.id] = []
+      this.ewmaNode[n.id] = {}
+    }
+    for (const l of LINKS) {
+      this.linkHist[l.id] = []
+      this.ewmaLink[l.id] = {}
+    }
   }
 
-  /** The pass path that is live right now (protect path during a reroute). */
+  /* ---------------------------------------------------------------- *
+   * EWMA helpers
+   * ---------------------------------------------------------------- */
+  private nodeEwma(id: string, key: keyof NodeMetrics, value: number) {
+    if (!this.ewmaNode[id][key]) this.ewmaNode[id][key] = new EWMATracker()
+    return this.ewmaNode[id][key]!.update(value as number)
+  }
+
+  private linkEwma(id: string, key: keyof LinkMetrics, value: number) {
+    if (!this.ewmaLink[id][key]) this.ewmaLink[id][key] = new EWMATracker()
+    return this.ewmaLink[id][key]!.update(value as number)
+  }
+
+  /**
+   * Compute an aggregate anomaly score across the feature vector.
+   * Returns fraction of metrics currently exceeding ANOMALY_THRESHOLD z-score.
+   * This replaces the simple DETECT_FRACTION ramp check — the detector now
+   * observes actual metric deviation, not wall-clock progress.
+   */
+  private computeAnomalyScore(frame: TelemetryFrame): number {
+    let flagged = 0
+    let total = 0
+    const NUMERIC_NODE_KEYS: (keyof NodeMetrics)[] = [
+      "inMbps", "outMbps", "ifErrorsPerS", "ifDiscardsPerS",
+      "queueDepthPct", "cpuPct", "labelChurnPerS", "rttMs", "jitterMs",
+      "bgpPrefixCount", "ospfConvergenceMs",
+    ]
+    for (const n of NODES) {
+      const m = frame.nodes[n.id]
+      for (const key of NUMERIC_NODE_KEYS) {
+        const { zScore } = this.nodeEwma(n.id, key, m[key] as number)
+        if (Math.abs(zScore) > ANOMALY_THRESHOLD) flagged++
+        total++
+      }
+    }
+    for (const l of LINKS) {
+      const m = frame.links[l.id]
+      for (const key of ["utilizationPct", "errorRatePct", "rekeyAgeSec", "jitterTrendMsPerS", "ecmpAsymmetryRatio"] as (keyof LinkMetrics)[]) {
+        const val = m[key] as number
+        if (typeof val === "number") {
+          const { zScore } = this.linkEwma(l.id, key, val)
+          if (Math.abs(zScore) > ANOMALY_THRESHOLD) flagged++
+          total++
+        }
+      }
+    }
+    return total > 0 ? flagged / total : 0
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Pass-path helpers
+   * ---------------------------------------------------------------- */
   private activePassPath(): string[] {
     return this.recovery?.rerouted ? PROTECT_LSP_PATH : PRIMARY_LSP_PATH
   }
 
-  /** Throughput a node carries given pass state and its role on the path. */
   private nodeLoadMbps(id: string): number {
     const onPath = this.activePassPath().includes(id)
     const base = BASE_MBPS + noise(15)
@@ -140,21 +266,26 @@ export class SentinelEngine {
     return base
   }
 
+  /* ---------------------------------------------------------------- *
+   * Metric builders
+   * ---------------------------------------------------------------- */
   private buildNodeMetrics(id: string): NodeMetrics {
     const load = this.nodeLoadMbps(id)
     const m: NodeMetrics = {
-      inMbps: clamp(load + noise(10), 0, 1000),
-      outMbps: clamp(load * 0.98 + noise(10), 0, 1000),
-      ifErrorsPerS: clamp(noise(0.05), 0, 100),
-      ifDiscardsPerS: clamp(noise(0.05), 0, 100),
-      queueDepthPct: clamp(12 + (load / 1000) * 20 + noise(4), 0, 100),
-      cpuPct: clamp(20 + (load / 1000) * 18 + noise(5), 0, 100),
-      ldpUp: 1,
-      ospfUp: 1,
-      lspUp: 1,
-      labelChurnPerS: clamp(noise(0.4) + 0.3, 0, 200),
-      rttMs: clamp(12 + noise(2), 0, 1000),
-      jitterMs: clamp(1.2 + noise(0.6), 0, 200),
+      inMbps:            clamp(load + noise(10), 0, 1000),
+      outMbps:           clamp(load * 0.98 + noise(10), 0, 1000),
+      ifErrorsPerS:      clamp(noise(0.05), 0, 100),
+      ifDiscardsPerS:    clamp(noise(0.05), 0, 100),
+      queueDepthPct:     clamp(12 + (load / 1000) * 20 + noise(4), 0, 100),
+      cpuPct:            clamp(20 + (load / 1000) * 18 + noise(5), 0, 100),
+      ldpUp:             1,
+      ospfUp:            1,
+      lspUp:             1,
+      labelChurnPerS:    clamp(noise(0.4) + 0.3, 0, 200),
+      rttMs:             clamp(12 + noise(2), 0, 1000),
+      jitterMs:          clamp(1.2 + noise(0.6), 0, 200),
+      bgpPrefixCount:    clamp(240 + noise(5), 0, 1000),   // stable ~240 prefixes
+      ospfConvergenceMs: clamp(8 + noise(2), 0, 5000),     // stable ~8ms
     }
     this.applyFaultToNode(id, m)
     return m
@@ -166,15 +297,70 @@ export class SentinelEngine {
     const onPath = path.includes(link.a) && path.includes(link.b)
     const util = (this.passActive && onPath ? 78 : this.passActive ? 35 : 22) + noise(5)
     const lm: LinkMetrics = {
-      utilizationPct: clamp(util, 0, 100),
-      up: 1,
-      errorRatePct: clamp(noise(0.02), 0, 100),
+      utilizationPct:      clamp(util, 0, 100),
+      up:                  1,
+      errorRatePct:        clamp(noise(0.02), 0, 100),
+      ikeState:            "established",
+      rekeyAgeSec:         clamp(3600 - (this.t % 3600) + noise(30), 0, 7200),
+      jitterTrendMsPerS:   clamp(noise(0.05), -5, 5),
+      ecmpAsymmetryRatio:  clamp(1.0 + noise(0.03), 0.8, 1.2),
     }
     this.applyFaultToLink(id, lm)
     return lm
   }
 
-  /** Ramp progress of the active fault, 0..(>1 after impact). */
+  private buildNominalController(): ControllerState {
+    return {
+      policyCompliancePct:  100,
+      driftingSites:        0,
+      totalSites:           7,
+      orchestrationLatencyMs: clamp(12 + noise(3), 0, 500),
+      tunnelsUp:            7,
+      tunnelsTotal:         7,
+      alarms:               [],
+    }
+  }
+
+  private buildControllerState(): ControllerState {
+    const f = this.active
+    const base = this.buildNominalController()
+    if (!f || f.faultClass !== "policy_drift") return base
+
+    const p = this.faultProgress()
+    const drifting = Math.round(p * 4)
+    const alarms: ControllerAlarm[] = []
+    if (p > 0.1) {
+      alarms.push({
+        id: `CTRL-${f.eventId}-1`,
+        severity: p > 0.6 ? "crit" : "warn",
+        message: `Policy deviation detected on site ${f.element}: QoS class mismatch`,
+        site: f.element,
+        ts: Date.now(),
+      })
+    }
+    if (p > 0.4) {
+      alarms.push({
+        id: `CTRL-${f.eventId}-2`,
+        severity: "crit",
+        message: `BGP route policy drift: traffic engineering constraints violated`,
+        site: "P3",
+        ts: Date.now(),
+      })
+    }
+    return {
+      policyCompliancePct:    clamp(100 - p * 85, 0, 100),
+      driftingSites:          drifting,
+      totalSites:             7,
+      orchestrationLatencyMs: clamp(12 + p * 400 + noise(20), 0, 2000),
+      tunnelsUp:              clamp(7 - Math.round(p * 2), 0, 7),
+      tunnelsTotal:           7,
+      alarms,
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Fault progress
+   * ---------------------------------------------------------------- */
   private faultProgress(): number {
     if (!this.active) return 0
     return (this.t - this.active.startT) / this.active.leadTimeS
@@ -185,18 +371,11 @@ export class SentinelEngine {
     return clamp((this.t - this.recovery.startT) / this.recovery.durationS, 0, 1)
   }
 
-  /**
-   * Effective fault intensity to apply to a node, considering both the active
-   * ramp and the taper-heal during a recovery window. Returns null if the node
-   * is unaffected.
-   */
-  private nodeFaultContext(
-    id: string,
-  ): { cls: FaultClass; intensity: number; benign: boolean } | null {
+  private nodeFaultContext(id: string): { cls: FaultClass; intensity: number; benign: boolean } | null {
     const f = this.active
     if (f && f.kind === "node" && f.element === id) {
       let intensity = clamp(this.faultProgress(), 0, 1.6)
-      if (f.benign) intensity = Math.min(intensity, 0.7) * 0.4 // mild, never impacts
+      if (f.benign) intensity = Math.min(intensity, 0.7) * 0.4
       return { cls: f.faultClass, intensity, benign: f.benign }
     }
     const r = this.recovery
@@ -218,96 +397,146 @@ export class SentinelEngine {
     return null
   }
 
+  /* ---------------------------------------------------------------- *
+   * Fault signal application
+   * ---------------------------------------------------------------- */
   private applyFaultToNode(id: string, m: NodeMetrics) {
     const ctx = this.nodeFaultContext(id)
     if (!ctx) return
     const p = ctx.intensity
-    if (ctx.cls === "ldp_instability") {
-      m.labelChurnPerS = clamp(0.3 + p * 120 + noise(8), 0, 400)
-      m.jitterMs = clamp(1.2 + p * 60 + noise(4), 0, 300)
-      m.cpuPct = clamp(m.cpuPct + p * 45, 0, 100)
-      if (p >= 1) {
-        m.ldpUp = Math.random() < 0.6 ? 0 : 1 // flapping
-        m.lspUp = m.ldpUp
-      }
-    } else if (ctx.cls === "congestion") {
-      m.queueDepthPct = clamp(m.queueDepthPct + p * 78 + noise(5), 0, 100)
-      m.outMbps = clamp(m.outMbps + p * 150, 0, 1000)
-      if (p >= 1) {
-        m.ifDiscardsPerS = clamp(40 + noise(20), 0, 500)
-        m.lspUp = 1 // congested but up; loss via discards
-      }
+
+    switch (ctx.cls) {
+      case "ldp_instability":
+        m.labelChurnPerS    = clamp(0.3 + p * 120 + noise(8), 0, 400)
+        m.jitterMs          = clamp(1.2 + p * 60 + noise(4), 0, 300)
+        m.cpuPct            = clamp(m.cpuPct + p * 45, 0, 100)
+        m.ospfConvergenceMs = clamp(8 + p * 800 + noise(30), 0, 5000)
+        if (p >= 1) {
+          m.ldpUp = Math.random() < 0.6 ? 0 : 1
+          m.lspUp = m.ldpUp
+        }
+        break
+
+      case "congestion":
+        m.queueDepthPct = clamp(m.queueDepthPct + p * 78 + noise(5), 0, 100)
+        m.outMbps       = clamp(m.outMbps + p * 150, 0, 1000)
+        if (p >= 1) {
+          m.ifDiscardsPerS = clamp(40 + noise(20), 0, 500)
+        }
+        break
+
+      case "bgp_route_flap":
+        // Primary signal: BGP prefix count oscillates, OSPF convergence spikes
+        m.bgpPrefixCount    = clamp(240 - p * 220 + noise(15) * (Math.random() > 0.5 ? 1 : -1), 0, 300)
+        m.ospfConvergenceMs = clamp(8 + p * 1200 + noise(50), 0, 5000)
+        m.cpuPct            = clamp(m.cpuPct + p * 35, 0, 100)
+        m.labelChurnPerS    = clamp(0.3 + p * 40 + noise(5), 0, 200)
+        if (p >= 1) {
+          m.ospfUp = Math.random() < 0.4 ? 0 : 1
+          m.bgpPrefixCount = clamp(noise(20), 0, 50) // near-zero during flap
+        }
+        // Cascade to downstream nodes
+        if (BGP_CASCADE_NODES.includes(id) && p > 0.5) {
+          m.bgpPrefixCount    = clamp(m.bgpPrefixCount - p * 80 + noise(10), 0, 300)
+          m.ospfConvergenceMs = clamp(8 + p * 400, 0, 5000)
+        }
+        break
+
+      case "policy_drift":
+        // Signal: rising orchestration latency, discards, CPU
+        m.queueDepthPct  = clamp(m.queueDepthPct + p * 40 + noise(5), 0, 100)
+        m.cpuPct         = clamp(m.cpuPct + p * 30, 0, 100)
+        m.ifDiscardsPerS = clamp(p * 25 + noise(5), 0, 100)
+        // Policy drift degrades jitter for traffic that loses QoS protection
+        m.jitterMs       = clamp(1.2 + p * 80 + noise(8), 0, 300)
+        break
     }
   }
 
   private applyFaultToLink(id: string, lm: LinkMetrics) {
     const ctx = this.linkFaultContext(id)
-    if (!ctx || ctx.cls !== "link_flap") return
+    if (!ctx) return
     const p = ctx.intensity
-    lm.errorRatePct = clamp(0.02 + p * p * 4.5 + noise(0.1), 0, 100)
-    if (p >= 1) {
-      lm.up = 0
-      lm.utilizationPct = 0
+
+    if (ctx.cls === "link_flap") {
+      lm.errorRatePct        = clamp(0.02 + p * p * 4.5 + noise(0.1), 0, 100)
+      lm.jitterTrendMsPerS   = clamp(p * 1.5 + noise(0.1), -5, 5)
+      lm.ecmpAsymmetryRatio  = clamp(1.0 + p * 0.4 + noise(0.05), 0.8, 2.0)
+      if (p >= 1) {
+        lm.up               = 0
+        lm.utilizationPct   = 0
+        lm.ikeState         = "down"
+        lm.rekeyAgeSec      = 0
+      } else if (p > 0.5) {
+        lm.ikeState         = "degraded"
+      }
+    }
+
+    if (ctx.cls === "bgp_route_flap") {
+      // Link stays up but asymmetry spikes during route oscillation
+      lm.ecmpAsymmetryRatio = clamp(1.0 + p * 0.8 + noise(0.1), 0.8, 2.5)
+      lm.jitterTrendMsPerS  = clamp(p * 2 + noise(0.2), -5, 5)
+      if (p > 0.7) lm.ikeState = "rekeying"
     }
   }
 
-  /** Run the prediction state machine after a frame is built. */
+  /* ---------------------------------------------------------------- *
+   * Prediction engine — EWMA-driven
+   * ---------------------------------------------------------------- */
   private runPrediction(frame: TelemetryFrame) {
-    // A recovery window owns the event surface until it completes.
     if (this.recovery) {
       this.stepRecovery(frame)
       return
     }
 
     const f = this.active
-    if (!f) {
-      this.event = null
-      return
-    }
-    const p = this.faultProgress()
-    const ttiTotal = f.leadTimeS
+    if (!f) { this.event = null; return }
+
+    const p         = this.faultProgress()
+    const ttiTotal  = f.leadTimeS
     const timeToImpactS = +(ttiTotal * (1 - p)).toFixed(1)
 
-    // Detection: fire once the ramp crosses the detection fraction.
-    if (!f.detected && p >= DETECT_FRACTION) {
+    // EWMA anomaly score (the real detection criterion)
+    const anomalyScore = this.computeAnomalyScore(frame)
+
+    // Detection fires when the anomaly score surpasses the threshold
+    if (!f.detected && anomalyScore >= DETECT_ANOMALY_FRAC) {
       f.detected = true
       if (!f.benign) {
         const leadTimeS = Math.max(0, +(ttiTotal * (1 - p)).toFixed(1))
         this.metrics.truePositives += 1
         this.metrics.leadTimesS.push(leadTimeS)
+        this.metrics.anomalyScores.push(anomalyScore)
         this.recomputeMetrics()
       }
     }
 
-    if (!f.detected) {
-      this.event = null
-      return
-    }
+    if (!f.detected) { this.event = null; return }
 
-    // Benign transient: low confidence, never reaches impact, auto-clears
-    // as a false alarm (the Copilot escalates instead of advising).
+    // Benign transient path
     if (f.benign) {
       const confidence = clamp(0.4 + p * 0.12, 0, BENIGN_CONF_CAP)
       this.event = {
         schemaVersion: PREDICTION_SCHEMA_VERSION,
-        modelVersion: MODEL_VERSION,
-        id: f.eventId,
-        element: f.element,
-        elementKind: f.kind,
-        faultClass: f.faultClass,
+        modelVersion:  MODEL_VERSION,
+        id:            f.eventId,
+        element:       f.element,
+        elementKind:   f.kind,
+        faultClass:    f.faultClass,
         probabilities: this.buildProbabilities(f.faultClass, p, true),
         timeToImpactS: Math.max(timeToImpactS, 0),
-        leadTimeS: this.event?.leadTimeS ?? timeToImpactS,
+        leadTimeS:     this.event?.leadTimeS ?? timeToImpactS,
         confidence,
-        phase: "degrading",
-        evidence: this.buildEvidence(f.faultClass, frame, f.element),
-        createdAt: this.event?.createdAt ?? frame.ts,
+        phase:         "degrading",
+        evidence:      this.buildEvidence(f.faultClass, frame, f.element),
+        createdAt:     this.event?.createdAt ?? frame.ts,
+        anomalyScore,
       }
       if (p >= BENIGN_RESOLVE) this.resolveFalseAlarm()
       return
     }
 
-    const confidence = clamp(0.5 + p * 0.55, 0, 0.99)
+    const confidence    = clamp(0.5 + anomalyScore * 2.2 + p * 0.3, 0, 0.99)
     const probabilities = this.buildProbabilities(f.faultClass, p, false)
     let phase: PredictionEvent["phase"] = "degrading"
     if (p >= 1) {
@@ -317,128 +546,260 @@ export class SentinelEngine {
       phase = "imminent"
     }
 
-    const leadTimeS = this.event?.leadTimeS ?? Math.max(0, +(ttiTotal * (1 - DETECT_FRACTION)).toFixed(1))
+    const leadTimeS = this.event?.leadTimeS ?? Math.max(0, +(ttiTotal * (1 - DETECT_ANOMALY_FRAC)).toFixed(1))
+    const cascadeNodes = f.faultClass === "bgp_route_flap" && p > 0.4 ? BGP_CASCADE_NODES : undefined
 
     this.event = {
       schemaVersion: PREDICTION_SCHEMA_VERSION,
-      modelVersion: MODEL_VERSION,
-      id: f.eventId,
-      element: f.element,
-      elementKind: f.kind,
-      faultClass: f.faultClass,
+      modelVersion:  MODEL_VERSION,
+      id:            f.eventId,
+      element:       f.element,
+      elementKind:   f.kind,
+      faultClass:    f.faultClass,
       probabilities,
       timeToImpactS: Math.max(timeToImpactS, phase === "failed" ? timeToImpactS : 0),
       leadTimeS,
       confidence,
       phase,
-      evidence: this.buildEvidence(f.faultClass, frame, f.element),
-      createdAt: this.event?.createdAt ?? frame.ts,
+      evidence:      this.buildEvidence(f.faultClass, frame, f.element),
+      createdAt:     this.event?.createdAt ?? frame.ts,
+      anomalyScore,
+      cascadeNodes,
     }
 
-    // Un-remediated fault: protect-path automatically kicks in after impact.
-    if (f.impacted && p >= 1.4) {
-      this.beginRecovery(false)
-    }
+    if (f.impacted && p >= 1.4) this.beginRecovery(false)
   }
 
-  /** Drive the recovering event surface and finalize when the window closes. */
   private stepRecovery(frame: TelemetryFrame) {
-    const r = this.recovery!
+    const r       = this.recovery!
     const recProg = this.recoveryProgress()
     const evidence = this.buildEvidence(r.faultClass, frame, r.element).map((e) => ({
-      ...e,
-      trend: "falling" as const,
+      ...e, trend: "falling" as const,
     }))
 
     this.event = {
       schemaVersion: PREDICTION_SCHEMA_VERSION,
-      modelVersion: MODEL_VERSION,
-      id: r.eventId,
-      element: r.element,
-      elementKind: r.kind,
-      faultClass: r.faultClass,
+      modelVersion:  MODEL_VERSION,
+      id:            r.eventId,
+      element:       r.element,
+      elementKind:   r.kind,
+      faultClass:    r.faultClass,
       probabilities: this.buildProbabilities(r.faultClass, 1 - recProg, false),
       timeToImpactS: 0,
-      leadTimeS: r.leadTimeS,
-      confidence: r.confidence,
-      phase: "recovering",
+      leadTimeS:     r.leadTimeS,
+      confidence:    r.confidence,
+      phase:         "recovering",
       evidence,
-      createdAt: frame.ts,
-      remediatedAt: Date.now(),
-      outcome: r.prevented ? "prevented" : "impacted",
+      createdAt:     frame.ts,
+      remediatedAt:  Date.now(),
+      outcome:       r.prevented ? "prevented" : "impacted",
     }
 
     if (recProg >= 1) {
       this.pushResolved(r)
       this.recovery = null
-      this.event = null
+      this.event    = null
       this.recomputeMetrics()
     }
   }
 
+  /* ---------------------------------------------------------------- *
+   * Probability / evidence helpers
+   * ---------------------------------------------------------------- */
   private buildProbabilities(cls: FaultClass, p: number, benign: boolean): Record<FaultClass, number> {
+    const allClasses: FaultClass[] = ["link_flap", "ldp_instability", "congestion", "bgp_route_flap", "policy_drift"]
     if (benign) {
-      // No clear winner — this is what "insufficient grounding" looks like.
-      const jitter = () => 0.33 + noise(0.05)
-      const base: Record<FaultClass, number> = {
-        link_flap: jitter(),
-        ldp_instability: jitter(),
-        congestion: jitter(),
+      const base: Record<FaultClass, number> = {} as Record<FaultClass, number>
+      let sum = 0
+      for (const c of allClasses) {
+        const v = 0.2 + noise(0.04)
+        base[c] = v
+        sum += v
       }
-      const sum = base.link_flap + base.ldp_instability + base.congestion
-      base.link_flap /= sum
-      base.ldp_instability /= sum
-      base.congestion /= sum
+      for (const c of allClasses) base[c] /= sum
       return base
     }
-    const hi = clamp(0.45 + p * 0.5, 0, 0.98)
-    const rest = (1 - hi) / 2
-    const base: Record<FaultClass, number> = {
-      link_flap: rest,
-      ldp_instability: rest,
-      congestion: rest,
-    }
+    const hi   = clamp(0.45 + p * 0.5, 0, 0.98)
+    const rest = (1 - hi) / (allClasses.length - 1)
+    const base: Record<FaultClass, number> = {} as Record<FaultClass, number>
+    for (const c of allClasses) base[c] = rest
     base[cls] = hi
     return base
   }
 
   private buildEvidence(cls: FaultClass, frame: TelemetryFrame, element: string): EvidenceRow[] {
-    if (cls === "link_flap") {
-      const lm = frame.links[element]
-      return [
-        { label: "Link error rate", value: `${lm.errorRatePct.toFixed(2)} %/s`, trend: "rising" },
-        { label: "Optical Tx power", value: "nominal", trend: "flat" },
-        { label: "Carrier-loss margin", value: "narrowing", trend: "falling" },
-      ]
+    switch (cls) {
+      case "link_flap": {
+        const lm = frame.links[element]
+        return [
+          { label: "Link error rate",     value: `${lm.errorRatePct.toFixed(2)} %/s`,       trend: "rising"  },
+          { label: "IKE tunnel state",    value: lm.ikeState,                               trend: lm.ikeState !== "established" ? "falling" : "flat" },
+          { label: "ECMP asymmetry",      value: `${lm.ecmpAsymmetryRatio.toFixed(2)}x`,    trend: lm.ecmpAsymmetryRatio > 1.1 ? "rising" : "flat" },
+          { label: "Carrier-loss margin", value: "narrowing",                               trend: "falling" },
+        ]
+      }
+      case "ldp_instability": {
+        const nm = frame.nodes[element]
+        return [
+          { label: "Label churn",         value: `${nm.labelChurnPerS.toFixed(0)} /s`,       trend: "rising" },
+          { label: "Session jitter",      value: `${nm.jitterMs.toFixed(0)} ms`,             trend: "rising" },
+          { label: "OSPF convergence",    value: `${nm.ospfConvergenceMs.toFixed(0)} ms`,    trend: "rising" },
+          { label: "Control-plane CPU",   value: `${nm.cpuPct.toFixed(0)} %`,               trend: "rising" },
+        ]
+      }
+      case "congestion": {
+        const nm = frame.nodes[element]
+        return [
+          { label: "Egress queue depth",  value: `${nm.queueDepthPct.toFixed(0)} %`,        trend: "rising"  },
+          { label: "Egress throughput",   value: `${nm.outMbps.toFixed(0)} Mbps`,           trend: "rising"  },
+          { label: "Tail-drop margin",    value: "narrowing",                               trend: "falling" },
+          { label: "Interface discards",  value: `${nm.ifDiscardsPerS.toFixed(0)} /s`,      trend: "rising"  },
+        ]
+      }
+      case "bgp_route_flap": {
+        const nm = frame.nodes[element]
+        return [
+          { label: "BGP prefix count",    value: `${nm.bgpPrefixCount.toFixed(0)}`,         trend: "falling" },
+          { label: "OSPF convergence",    value: `${nm.ospfConvergenceMs.toFixed(0)} ms`,   trend: "rising"  },
+          { label: "Label churn",         value: `${nm.labelChurnPerS.toFixed(0)} /s`,      trend: "rising"  },
+          { label: "Cascade risk",        value: `${BGP_CASCADE_NODES.join(", ")}`,         trend: "rising"  },
+        ]
+      }
+      case "policy_drift": {
+        const ctrl = frame.controller
+        return [
+          { label: "Policy compliance",   value: `${ctrl.policyCompliancePct.toFixed(0)} %`, trend: "falling" },
+          { label: "Drifting sites",      value: `${ctrl.driftingSites} / ${ctrl.totalSites}`, trend: "rising" },
+          { label: "Orchestration lat",   value: `${ctrl.orchestrationLatencyMs.toFixed(0)} ms`, trend: "rising" },
+          { label: "Tunnels up",          value: `${ctrl.tunnelsUp} / ${ctrl.tunnelsTotal}`, trend: "falling" },
+        ]
+      }
     }
-    if (cls === "ldp_instability") {
-      const nm = frame.nodes[element]
-      return [
-        { label: "Label churn", value: `${nm.labelChurnPerS.toFixed(0)} /s`, trend: "rising" },
-        { label: "Session jitter", value: `${nm.jitterMs.toFixed(0)} ms`, trend: "rising" },
-        { label: "Control-plane CPU", value: `${nm.cpuPct.toFixed(0)} %`, trend: "rising" },
-      ]
-    }
-    const nm = frame.nodes[element]
-    return [
-      { label: "Egress queue depth", value: `${nm.queueDepthPct.toFixed(0)} %`, trend: "rising" },
-      { label: "Egress throughput", value: `${nm.outMbps.toFixed(0)} Mbps`, trend: "rising" },
-      { label: "Tail-drop margin", value: "narrowing", trend: "falling" },
-    ]
   }
 
+  /* ---------------------------------------------------------------- *
+   * NetFlow emitter
+   * ---------------------------------------------------------------- */
+  private emitNetFlow(frame: TelemetryFrame) {
+    if (this.t % NETFLOW_INTERVAL_S !== 0) return
+    const nodeIds = NODES.map((n) => n.id)
+    const exporter = nodeIds[Math.floor(Math.random() * nodeIds.length)]
+    const nm = frame.nodes[exporter]
+    const isFaultNode = this.active && this.active.element === exporter
+    const bytes = Math.round((nm.outMbps * 1e6 / 8) * NETFLOW_INTERVAL_S * (0.9 + noise(0.1)))
+
+    const record: NetFlowRecord = {
+      schemaVersion: NETFLOW_SCHEMA_VERSION,
+      srcIp:         randomIp("10.0"),
+      dstIp:         randomIp("10.1"),
+      srcPort:       1024 + Math.floor(Math.random() * 60000),
+      dstPort:       isFaultNode ? 179 : [443, 8080, 53, 9000][Math.floor(Math.random() * 4)],
+      protocol:      isFaultNode ? "TCP" : (Math.random() > 0.3 ? "TCP" : "UDP"),
+      dscp:          this.passActive ? 46 : 0,   // EF for pass traffic, BE otherwise
+      bytes,
+      packets:       Math.round(bytes / 1024),
+      startMs:       frame.ts - NETFLOW_INTERVAL_S * 1000,
+      endMs:         frame.ts,
+      ingressIf:     `${exporter}/0/0`,
+      egressIf:      `${exporter}/0/1`,
+      exporterNode:  exporter,
+    }
+    this.flowLog.unshift(record)
+    if (this.flowLog.length > 30) this.flowLog.pop()
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Syslog emitter
+   * ---------------------------------------------------------------- */
+  private emitSyslog(frame: TelemetryFrame) {
+    const f = this.active
+    if (!f || !f.detected) return
+    const p = this.faultProgress()
+    // Only emit at certain progress thresholds to avoid flooding
+    const thresholds = [0.2, 0.5, 0.8, 1.0, 1.2]
+    const prevP = (this.t - f.startT - 1) / f.leadTimeS
+    const crossed = thresholds.find((t) => prevP < t && p >= t)
+    if (!crossed) return
+
+    const sev = p >= 1 ? "crit" : p >= 0.8 ? "err" : p >= 0.5 ? "warning" : "notice"
+    const msgs: Record<FaultClass, string[]> = {
+      link_flap: [
+        `%LINK-3-UPDOWN: Interface ${f.element}, changed state to down`,
+        `%OSPF-5-ADJCHG: Process 1, Nbr 10.0.0.1 on ${f.element} from FULL to DOWN, Neighbor Down`,
+        `%LDP-5-NBRCHG: LDP Neighbor ${f.element} is down`,
+        `%MPLS-3-LSP_FAILED: LSP to 192.168.0.0/16 through ${f.element} failed`,
+      ],
+      ldp_instability: [
+        `%LDP-5-NBRCHG: Neighbor session churn on ${f.element}, holdtime expired`,
+        `%MPLS-4-LCHAIN: Label chain rebuild triggered on ${f.element}, ${Math.round(p * 120)}/s events`,
+        `%LDP-3-SESS_PROT: LDP session protection activated on ${f.element}`,
+        `%LDP-1-LSPDROP: LSP blackhole risk on ${f.element}, label table unstable`,
+      ],
+      congestion: [
+        `%QUEUE-4-DEPTH: Egress queue depth on ${f.element} at ${Math.round(p * 80)}%`,
+        `%QOS-3-TAILDROP: Tail-drop active on ${f.element}, class best-effort`,
+        `%IF-3-DISCARD: Interface ${f.element} discarding ${Math.round(p * 40)} pkts/s`,
+        `%QOS-2-PASSDROP: PASS class traffic drop on ${f.element}: queue saturated`,
+      ],
+      bgp_route_flap: [
+        `%BGP-5-ADJCHANGE: neighbor 10.0.0.1 Down Peer closed the session`,
+        `%BGP-3-NOTIFICATION: CEASE from neighbor 10.0.0.1, prefix count ${Math.round(240 - p * 200)}`,
+        `%OSPF-5-ADJCHG: Convergence triggered by BGP path change from ${f.element}`,
+        `%MPLS-4-REROUTE: TE path recalculation due to BGP instability on ${f.element}`,
+      ],
+      policy_drift: [
+        `%SDWAN-4-POLICY: QoS policy mismatch detected on ${f.element}: expected class-map PASS`,
+        `%SDWAN-3-DRIFT: Traffic engineering constraint violated on site ${f.element}`,
+        `%SDWAN-2-TUNNEL: Tunnel ${f.element}/ike0 policy compliance failure`,
+        `%SDWAN-1-CRITICAL: Service level degradation due to policy drift on ${f.element}`,
+      ],
+    }
+
+    const msgList = msgs[f.faultClass]
+    const msgIdx  = thresholds.indexOf(crossed)
+    const message = msgList[Math.min(msgIdx, msgList.length - 1)]
+    const hostname = f.element.replace("-", "")
+
+    const log: SyslogEvent = {
+      schemaVersion: SYSLOG_SCHEMA_VERSION,
+      priority:      (16 * 8) + (["emerg","alert","crit","err","warning","notice","info","debug"].indexOf(sev)),
+      severity:      sev as SyslogEvent["severity"],
+      facility:      16, // local0
+      timestamp:     isoNow(),
+      hostname,
+      appName:       "FRRouting",
+      procId:        String(1000 + Math.floor(Math.random() * 9000)),
+      msgId:         `${f.faultClass.toUpperCase().replace("_","-")}-${msgIdx}`,
+      message,
+      structuredData: {
+        element: f.element,
+        faultClass: f.faultClass,
+        progress: p.toFixed(2),
+        eventId: f.eventId,
+      },
+    }
+    this.syslogLog.unshift(log)
+    if (this.syslogLog.length > 50) this.syslogLog.pop()
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Metrics
+   * ---------------------------------------------------------------- */
   private recomputeMetrics() {
     const m = this.metrics
     m.tpr = m.injectedFaults ? m.truePositives / m.injectedFaults : 0
     const minutes = Math.max(this.t / 60, 1 / 60)
     m.farPer10Min = +(m.falseAlarms / (minutes / 10)).toFixed(2)
     const sorted = [...m.leadTimesS].sort((a, b) => a - b)
-    m.medianLeadTimeS = sorted.length
-      ? +(sorted[Math.floor(sorted.length / 2)]).toFixed(1)
+    m.medianLeadTimeS = sorted.length ? +(sorted[Math.floor(sorted.length / 2)]).toFixed(1) : 0
+    m.meanAnomalyScore = m.anomalyScores.length
+      ? +(m.anomalyScores.reduce((a, b) => a + b, 0) / m.anomalyScores.length).toFixed(3)
       : 0
   }
 
-  /** Advance one simulated second and emit a frame. */
+  /* ---------------------------------------------------------------- *
+   * Main tick
+   * ---------------------------------------------------------------- */
   tick(): TelemetryFrame {
     this.t += 1
     const nodes: Record<string, NodeMetrics> = {}
@@ -446,15 +807,18 @@ export class SentinelEngine {
     for (const n of NODES) nodes[n.id] = this.buildNodeMetrics(n.id)
     for (const l of LINKS) links[l.id] = this.buildLinkMetrics(l.id)
 
+    this.controllerState = this.buildControllerState()
+
     const frame: TelemetryFrame = {
       schemaVersion: TELEMETRY_SCHEMA_VERSION,
       t: this.t,
       ts: Date.now(),
       nodes,
       links,
+      controller: this.controllerState,
     }
 
-    // push history
+    // Rolling history
     this.tHist.push(this.t)
     if (this.tHist.length > HISTORY) this.tHist.shift()
     for (const n of NODES) {
@@ -469,64 +833,73 @@ export class SentinelEngine {
     }
 
     this.runPrediction(frame)
+    this.emitNetFlow(frame)
+    this.emitSyslog(frame)
     return frame
   }
 
+  /* ---------------------------------------------------------------- *
+   * Public controls
+   * ---------------------------------------------------------------- */
   injectFault(faultClass: FaultClass) {
-    if (this.active || this.recovery) return // one scenario at a time in the demo
+    if (this.active || this.recovery) return
     const target = FAULT_TARGET[faultClass]
     this.active = {
       faultClass,
-      element: target.element,
-      kind: target.kind,
-      startT: this.t,
-      leadTimeS: 40 + Math.round(Math.random() * 35), // 40..75s
+      element:  target.element,
+      kind:     target.kind,
+      startT:   this.t,
+      leadTimeS: 40 + Math.round(Math.random() * 35),
       detected: false,
       impacted: false,
-      eventId: `EVT-${Date.now().toString(36).toUpperCase()}`,
-      benign: false,
+      eventId:  `EVT-${Date.now().toString(36).toUpperCase()}`,
+      benign:   false,
     }
     this.metrics.injectedFaults += 1
     this.recomputeMetrics()
+    // Emit an initial syslog notice
+    this.syslogLog.unshift({
+      schemaVersion: SYSLOG_SCHEMA_VERSION,
+      priority: (16 * 8) + 5,
+      severity: "notice",
+      facility: 16,
+      timestamp: isoNow(),
+      hostname: target.element.replace("-", ""),
+      appName: "FRRouting",
+      procId: String(1000 + Math.floor(Math.random() * 9000)),
+      msgId: `${faultClass.toUpperCase().replace("_","-")}-INIT`,
+      message: `Fault scenario initiated: ${FAULT_LABELS[faultClass]} on ${target.element}`,
+      structuredData: { faultClass, element: target.element },
+    })
   }
 
-  /**
-   * Inject a benign transient: a brief glitch that trips detection at low
-   * confidence. The Copilot escalates (no grounded advice), it self-clears
-   * without impact, and it counts as a false alarm. Exercises the FAR metric
-   * and the anti-hallucination escalation path.
-   */
   injectTransient() {
     if (this.active || this.recovery) return
     this.active = {
       faultClass: "ldp_instability",
-      element: "P2",
-      kind: "node",
-      startT: this.t,
-      leadTimeS: 30 + Math.round(Math.random() * 15),
-      detected: false,
-      impacted: false,
-      eventId: `EVT-${Date.now().toString(36).toUpperCase()}`,
-      benign: true,
+      element:    "P2",
+      kind:       "node",
+      startT:     this.t,
+      leadTimeS:  30 + Math.round(Math.random() * 15),
+      detected:   false,
+      impacted:   false,
+      eventId:    `EVT-${Date.now().toString(36).toUpperCase()}`,
+      benign:     true,
     }
-    // NOTE: not counted in injectedFaults — there is no real fault to detect.
   }
 
-  /** Operator applies the recommended remediation before impact. */
   remediate() {
     const f = this.active
     if (!f || f.benign || !this.event) return
     this.beginRecovery(!f.impacted)
   }
 
-  /** Estimate packets of loss avoided over the exposure window. */
   private estimatePrevented(): number {
     const exposureS = Math.max(this.event?.timeToImpactS ?? 0, 5)
     const pps = ((this.passActive ? PASS_MBPS : BASE_MBPS) * 1e6) / (1500 * 8)
     return Math.round(pps * exposureS)
   }
 
-  /** Transition the active fault into a visible recovery window. */
   private beginRecovery(prevented: boolean) {
     const f = this.active
     if (!f) return
@@ -534,25 +907,39 @@ export class SentinelEngine {
     if (prevented) this.metrics.packetsLossPrevented += packetsPrevented
 
     this.recovery = {
-      eventId: f.eventId,
-      element: f.element,
-      kind: f.kind,
-      faultClass: f.faultClass,
-      startT: this.t,
-      durationS: RECOVERY_S,
+      eventId:         f.eventId,
+      element:         f.element,
+      kind:            f.kind,
+      faultClass:      f.faultClass,
+      startT:          this.t,
+      durationS:       RECOVERY_S,
       packetsPrevented,
       prevented,
-      // Congestion is mitigated in place via QoS; the others reroute traffic.
-      rerouted: f.faultClass !== "congestion",
-      progressAtEnd: clamp(this.faultProgress(), 0, 1.6),
-      leadTimeS: this.event?.leadTimeS ?? 0,
-      confidence: this.event?.confidence ?? 0,
+      rerouted:        f.faultClass !== "congestion" && f.faultClass !== "policy_drift",
+      progressAtEnd:   clamp(this.faultProgress(), 0, 1.6),
+      leadTimeS:       this.event?.leadTimeS ?? 0,
+      confidence:      this.event?.confidence ?? 0,
+      anomalyScore:    this.event?.anomalyScore,
     }
     this.active = null
     this.recomputeMetrics()
+
+    // Remediation syslog
+    this.syslogLog.unshift({
+      schemaVersion: SYSLOG_SCHEMA_VERSION,
+      priority: (16 * 8) + 5,
+      severity: "notice",
+      facility: 16,
+      timestamp: isoNow(),
+      hostname: f.element.replace("-",""),
+      appName: "sentinel-noc",
+      procId: "1",
+      msgId: "REMEDIATE",
+      message: `Remediation applied: ${FAULT_LABELS[f.faultClass]} on ${f.element}. ${prevented ? "Pre-impact — no loss." : "Post-impact — recover via protect path."}`,
+      structuredData: { faultClass: f.faultClass, element: f.element, prevented: String(prevented) },
+    })
   }
 
-  /** Benign transient self-clears as a false alarm. */
   private resolveFalseAlarm() {
     const f = this.active
     if (!f) return
@@ -601,25 +988,105 @@ export class SentinelEngine {
     if (this.eventLog.length > 8) this.eventLog.pop()
   }
 
-  setPass(on: boolean) {
-    this.passActive = on
-  }
-  setAirGapped(on: boolean) {
-    this.airGapped = on
+  setPass(on: boolean)     { this.passActive = on }
+  setAirGapped(on: boolean) { this.airGapped = on }
+
+  reset() {
+    this.active   = null
+    this.event    = null
+    this.recovery = null
+    this.eventLog = []
+    this.flowLog  = []
+    this.syslogLog= []
+    this.metrics = {
+      injectedFaults: 0, truePositives: 0, falseAlarms: 0,
+      tpr: 0, farPer10Min: 0, leadTimesS: [], medianLeadTimeS: 0,
+      packetsLossPrevented: 0, reactiveMttdS: 180, reactiveMttrS: 1500,
+      anomalyScores: [], meanAnomalyScore: 0,
+    }
+    for (const n of NODES) {
+      this.nodeHist[n.id] = []
+      for (const k of Object.keys(this.ewmaNode[n.id])) {
+        this.ewmaNode[n.id][k as keyof NodeMetrics]!.reset()
+      }
+    }
+    for (const l of LINKS) {
+      this.linkHist[l.id] = []
+      for (const k of Object.keys(this.ewmaLink[l.id])) {
+        this.ewmaLink[l.id][k as keyof LinkMetrics]!.reset()
+      }
+    }
+    this.tHist = []
+    this.t = 0
+    this.controllerState = this.buildNominalController()
   }
 
-  /** Series for charts: a single numeric metric over history for an element. */
+  runDemoScript(onStep: (step: string) => void): () => void {
+    const timers: ReturnType<typeof setTimeout>[] = []
+    const s = (ms: number, fn: () => void, label: string) => {
+      timers.push(setTimeout(() => { fn(); onStep(label) }, ms))
+    }
+    s(500,   () => { this.setPass(true) },                      "Pass activated")
+    s(3000,  () => { this.injectFault("link_flap") },           "Injecting link flap…")
+    s(8000,  () => { this.remediate() },                        "Applying remediation (link flap)")
+    s(22000, () => { this.injectFault("ldp_instability") },     "Injecting LDP churn…")
+    s(30000, () => { this.remediate() },                        "Applying remediation (LDP churn)")
+    s(44000, () => { this.injectFault("bgp_route_flap") },      "Injecting BGP route flap…")
+    s(52000, () => { this.remediate() },                        "Applying remediation (BGP)")
+    s(66000, () => { this.injectFault("congestion") },          "Injecting congestion…")
+    s(74000, () => { this.remediate() },                        "Applying remediation (congestion)")
+    s(88000, () => { this.injectFault("policy_drift") },        "Injecting policy drift…")
+    s(96000, () => { this.remediate() },                        "Applying remediation (policy drift)")
+    return () => timers.forEach(clearTimeout)
+  }
+
   nodeSeries(id: string, key: keyof NodeMetrics): number[] {
     return this.nodeHist[id]?.map((m) => m[key] as number) ?? []
   }
   linkSeries(id: string, key: keyof LinkMetrics): number[] {
     return this.linkHist[id]?.map((m) => m[key] as number) ?? []
   }
-  times(): number[] {
-    return [...this.tHist]
-  }
+  times(): number[] { return [...this.tHist] }
+  faultLabel(cls: FaultClass) { return FAULT_LABELS[cls] }
+}
 
-  faultLabel(cls: FaultClass) {
-    return FAULT_LABELS[cls]
-  }
+/* ------------------------------------------------------------------ *
+ * gNMI Adapter Stub
+ * ------------------------------------------------------------------ *
+ * In production, replace the simulator's tick() with a gNMI Subscribe
+ * stream that maps OpenConfig paths to TelemetryFrame fields.
+ *
+ * Path mapping (gNMI -> TelemetryFrame):
+ *
+ *   /interfaces/interface[name=*]/state/counters/in-octets
+ *     -> nodes[id].inMbps (converted from octets/interval)
+ *
+ *   /interfaces/interface[name=*]/state/counters/out-octets
+ *     -> nodes[id].outMbps
+ *
+ *   /network-instances/network-instance/protocols/protocol[identifier=BGP]/bgp/global/state/total-prefixes
+ *     -> nodes[id].bgpPrefixCount
+ *
+ *   /network-instances/network-instance/protocols/protocol[identifier=OSPF]/ospf/global/timers/spf/state/last-execution-time
+ *     -> nodes[id].ospfConvergenceMs
+ *
+ *   /mpls/lsps/constrained-path/tunnels/tunnel[name=*]/state/counters/bytes
+ *     -> links[id].utilizationPct (derived from capacity)
+ *
+ *   /interfaces/interface[name=*]/subinterfaces/subinterface/ipv4/addresses/address/vrrp/vrrp-group/state/current-priority
+ *     -> derived for ecmpAsymmetryRatio
+ *
+ * Usage:
+ *   import { adaptGnmiUpdate } from "@/lib/sentinel/simulator"
+ *   const frame = adaptGnmiUpdate(gnmiNotification, lastFrame)
+ */
+export function adaptGnmiUpdate(
+  notification: unknown,
+  lastFrame: TelemetryFrame,
+): TelemetryFrame {
+  // Stub: return last frame unchanged.
+  // In production: parse notification.updates[], match OpenConfig paths,
+  // map to TelemetryFrame fields, compute derived metrics.
+  void notification
+  return { ...lastFrame, ts: Date.now() }
 }

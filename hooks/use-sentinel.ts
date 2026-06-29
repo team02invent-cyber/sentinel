@@ -1,13 +1,16 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
-import { generateCopilotResponse } from "@/lib/sentinel/copilot"
+import { answerQuery, generateCopilotResponse } from "@/lib/sentinel/copilot"
 import { SentinelEngine, type RecoveryState } from "@/lib/sentinel/simulator"
 import type {
+  ControllerState,
   CopilotResponse,
   FaultClass,
+  NetFlowRecord,
   PredictionEvent,
   SessionMetrics,
+  SyslogEvent,
   TelemetryFrame,
 } from "@/lib/sentinel/schema"
 
@@ -25,6 +28,9 @@ export interface SentinelSnapshot {
   airGapped: boolean
   running: boolean
   t: number
+  flowLog: NetFlowRecord[]
+  syslogLog: SyslogEvent[]
+  controller: ControllerState | null
 }
 
 export function useSentinel() {
@@ -33,6 +39,8 @@ export function useSentinel() {
 
   const [running, setRunning] = useState(true)
   const [selected, setSelected] = useState<string | null>(null)
+  const [demoStep, setDemoStep] = useState<string | null>(null)
+  const demoCancelRef = useRef<(() => void) | null>(null)
   const [snap, setSnap] = useState<SentinelSnapshot>({
     frame: null,
     event: null,
@@ -44,6 +52,9 @@ export function useSentinel() {
     airGapped: false,
     running: true,
     t: 0,
+    flowLog: [],
+    syslogLog: [],
+    controller: null,
   })
 
   // Cache the copilot response per event id so it isn't regenerated each tick.
@@ -57,15 +68,20 @@ export function useSentinel() {
       let copilot: CopilotResponse | null = null
       if (engine.event) {
         if (copilotCache.current?.id !== engine.event.id) {
-          copilotCache.current = {
-            id: engine.event.id,
-            resp: generateCopilotResponse({
-              schemaVersion: "1.0",
-              event: engine.event,
-            }),
-          }
+          // Generate async — fire and forget; the cache will fill on the next tick
+          const eventId = engine.event.id
+          const eventSnapshot = { ...engine.event }
+          generateCopilotResponse({
+            schemaVersion: "2.0",
+            event: eventSnapshot,
+          }).then((resp) => {
+            // Only store if still the same event
+            if (copilotCache.current?.id !== eventId) {
+              copilotCache.current = { id: eventId, resp }
+            }
+          }).catch(() => {/* handled inside generateCopilotResponse */})
         }
-        copilot = copilotCache.current.resp
+        copilot = copilotCache.current?.resp ?? null
       } else {
         copilotCache.current = null
       }
@@ -81,6 +97,9 @@ export function useSentinel() {
         airGapped: engine.airGapped,
         running: true,
         t: engine.t,
+        flowLog: [...engine.flowLog],
+        syslogLog: [...engine.syslogLog],
+        controller: { ...engine.controllerState },
       })
     }, TICK_MS)
     return () => clearInterval(interval)
@@ -105,6 +124,23 @@ export function useSentinel() {
   }, [])
   const toggleRunning = useCallback(() => setRunning((r) => !r), [])
 
+  const reset = useCallback(() => {
+    demoCancelRef.current?.()
+    demoCancelRef.current = null
+    setDemoStep(null)
+    copilotCache.current = null
+    engineRef.current!.reset()
+  }, [])
+
+  const runDemo = useCallback(() => {
+    demoCancelRef.current?.()
+    copilotCache.current = null
+    engineRef.current!.reset()
+    setRunning(true)
+    const cancel = engineRef.current!.runDemoScript((step) => setDemoStep(step))
+    demoCancelRef.current = cancel
+  }, [])
+
   const nodeSeries = useCallback(
     (id: string, key: Parameters<SentinelEngine["nodeSeries"]>[1]) =>
       engineRef.current!.nodeSeries(id, key),
@@ -126,8 +162,12 @@ export function useSentinel() {
     togglePass,
     toggleAirGap,
     toggleRunning,
+    reset,
+    runDemo,
+    demoStep,
     running,
     nodeSeries,
     linkSeries,
+    answerQuery,
   }
 }
