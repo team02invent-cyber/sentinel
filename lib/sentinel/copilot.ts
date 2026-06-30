@@ -316,46 +316,25 @@ const TEMPLATES: Record<FaultClass, Template> = {
 }
 
 /* ------------------------------------------------------------------ *
- * Ollama LLM integration
+ * Ollama LLM integration — proxied via /api/copilot (server-side)
+ * This runs in the browser; direct localhost:11434 access is blocked
+ * by the browser's same-origin policy. The Next.js API route handles
+ * the actual Ollama fetch on the Node.js server side.
  * ------------------------------------------------------------------ */
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434"
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "mistral"
-
-interface OllamaGenerateRequest {
-  model: string
-  prompt: string
-  stream: false
-  options?: { temperature?: number; top_p?: number }
-}
-
-interface OllamaGenerateResponse {
-  model: string
-  created_at: string
-  response: string
-  done: boolean
-}
 
 async function callOllamaLLM(prompt: string): Promise<{ response: string; inferenceMs: number }> {
-  const start = Date.now()
-  try {
-    const res = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        prompt,
-        stream: false,
-        options: { temperature: 0.3, top_p: 0.9 },
-      } as OllamaGenerateRequest),
-      signal: AbortSignal.timeout(15000), // 15s timeout
-    })
-    if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`)
-    const data = (await res.json()) as OllamaGenerateResponse
-    return { response: data.response, inferenceMs: Date.now() - start }
-  } catch (err) {
-    console.warn("[v0] Ollama LLM call failed:", err)
-    throw err
+  const res = await fetch("/api/copilot", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt }),
+    signal: AbortSignal.timeout(35000), // Mistral 7B can take ~20s on first token
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
+    throw new Error((err as { error: string }).error || `HTTP ${res.status}`)
   }
+  const data = (await res.json()) as { response: string; inferenceMs: number }
+  return data
 }
 
 function buildLLMPrompt(event: PredictionEvent, docs: CorpusEntry[]): string {
