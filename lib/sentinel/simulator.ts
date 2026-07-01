@@ -52,10 +52,10 @@ const BENIGN_CONF_CAP = 0.53
 const NETFLOW_INTERVAL_S = 5 // emit a flow record every N sim-seconds
 
 /* EWMA detector constants */
-const EWMA_ALPHA = 0.15        // smoothing factor
-const ZSCORE_WINDOW = 30       // samples for rolling std-dev
+const EWMA_ALPHA = 0.15        // smoothing factor for nominal baseline drift
+const WARMUP_SAMPLES = 12      // observations used to learn a frozen baseline
 const ANOMALY_THRESHOLD = 2.5  // z-score magnitude to flag a metric
-const DETECT_ANOMALY_FRAC = 0.18 // anomaly score fraction to fire prediction
+const DETECT_ANOMALY_FRAC = 0.30 // fraction of an element's own signals that must trip
 
 /** Which element each fault class targets in the demo. */
 const FAULT_TARGET: Record<FaultClass, { element: string; kind: "node" | "link" }> = {
@@ -103,27 +103,52 @@ export interface RecoveryState {
  * ------------------------------------------------------------------ */
 class EWMATracker {
   private baseline: number | null = null
-  private history: number[] = []
+  private warmup: number[] = []
+  private frozenMean = 0
+  private frozenStd = 1
+  private frozen = false
 
   update(value: number): { ewma: number; zScore: number } {
     if (this.baseline === null) this.baseline = value
-    this.baseline = EWMA_ALPHA * value + (1 - EWMA_ALPHA) * this.baseline
-    this.history.push(value)
-    if (this.history.length > ZSCORE_WINDOW) this.history.shift()
 
-    const n = this.history.length
-    if (n < 4) return { ewma: this.baseline, zScore: 0 }
+    // Phase 1: warm-up — learn a stable baseline from the first WARMUP_SAMPLES
+    // observations (assumed nominal), then FREEZE the reference statistics so
+    // an anomaly can never be absorbed into the baseline.
+    if (!this.frozen) {
+      this.warmup.push(value)
+      this.baseline = EWMA_ALPHA * value + (1 - EWMA_ALPHA) * this.baseline
+      if (this.warmup.length >= WARMUP_SAMPLES) {
+        const n = this.warmup.length
+        this.frozenMean = this.warmup.reduce((a, b) => a + b, 0) / n
+        const variance = this.warmup.reduce((a, b) => a + (b - this.frozenMean) ** 2, 0) / n
+        // Floor the std so tiny-variance nominal signals don't produce huge
+        // z-scores, but keep it small enough that gradual precursor drift on
+        // low-range signals (ecmp ratio, jitter trend) is detected during the
+        // fault ramp — giving genuine pre-impact lead time.
+        this.frozenStd = Math.max(Math.sqrt(variance), Math.abs(this.frozenMean) * 0.02, 0.15)
+        this.frozen = true
+      }
+      return { ewma: this.baseline, zScore: 0 }
+    }
 
-    const mean = this.history.reduce((a, b) => a + b, 0) / n
-    const variance = this.history.reduce((a, b) => a + (b - mean) ** 2, 0) / n
-    const std = Math.sqrt(variance) || 1
-    const zScore = (value - mean) / std
-    return { ewma: this.baseline, zScore }
+    // Phase 2: score against the frozen baseline.
+    const zScore = (value - this.frozenMean) / this.frozenStd
+
+    // Only let the baseline track genuinely nominal drift (|z| small). When the
+    // signal is anomalous we leave the reference untouched so the z-score keeps
+    // reflecting the deviation for the whole duration of the fault.
+    if (Math.abs(zScore) < ANOMALY_THRESHOLD) {
+      this.frozenMean = EWMA_ALPHA * value + (1 - EWMA_ALPHA) * this.frozenMean
+    }
+    return { ewma: this.frozenMean, zScore }
   }
 
   reset(value?: number) {
     this.baseline = value ?? null
-    this.history = []
+    this.warmup = []
+    this.frozenMean = 0
+    this.frozenStd = 1
+    this.frozen = false
   }
 }
 
@@ -231,33 +256,44 @@ export class SentinelEngine {
    * observes actual metric deviation, not wall-clock progress.
    */
   private computeAnomalyScore(frame: TelemetryFrame): number {
-    let flagged = 0
-    let total = 0
     const NUMERIC_NODE_KEYS: (keyof NodeMetrics)[] = [
       "inMbps", "outMbps", "ifErrorsPerS", "ifDiscardsPerS",
       "queueDepthPct", "cpuPct", "labelChurnPerS", "rttMs", "jitterMs",
       "bgpPrefixCount", "ospfConvergenceMs",
     ]
+    const LINK_KEYS: (keyof LinkMetrics)[] = [
+      "utilizationPct", "errorRatePct", "rekeyAgeSec", "jitterTrendMsPerS", "ecmpAsymmetryRatio",
+    ]
+
+    // Per-element anomaly fraction. A real fault is localized, so we score each
+    // element (node or link) against its OWN signals and take the worst-hit
+    // element rather than diluting one hotspot across the whole fabric.
+    let maxFrac = 0
+    // Always update every EWMA tracker (so baselines stay warm), but score locally.
     for (const n of NODES) {
       const m = frame.nodes[n.id]
+      let flagged = 0
       for (const key of NUMERIC_NODE_KEYS) {
         const { zScore } = this.nodeEwma(n.id, key, m[key] as number)
         if (Math.abs(zScore) > ANOMALY_THRESHOLD) flagged++
-        total++
       }
+      maxFrac = Math.max(maxFrac, flagged / NUMERIC_NODE_KEYS.length)
     }
     for (const l of LINKS) {
       const m = frame.links[l.id]
-      for (const key of ["utilizationPct", "errorRatePct", "rekeyAgeSec", "jitterTrendMsPerS", "ecmpAsymmetryRatio"] as (keyof LinkMetrics)[]) {
+      let flagged = 0
+      let counted = 0
+      for (const key of LINK_KEYS) {
         const val = m[key] as number
         if (typeof val === "number") {
           const { zScore } = this.linkEwma(l.id, key, val)
           if (Math.abs(zScore) > ANOMALY_THRESHOLD) flagged++
-          total++
+          counted++
         }
       }
+      if (counted > 0) maxFrac = Math.max(maxFrac, flagged / counted)
     }
-    return total > 0 ? flagged / total : 0
+    return maxFrac
   }
 
   /* ---------------------------------------------------------------- *
@@ -508,6 +544,7 @@ export class SentinelEngine {
     // EWMA anomaly score (the real detection criterion)
     const anomalyScore = this.computeAnomalyScore(frame)
 
+    console.log("[v0] anomalyScore", anomalyScore.toFixed(3), "progress", p.toFixed(2), "fault", f.faultClass, "detected", f.detected)
     // Detection fires when the anomaly score surpasses the threshold
     if (!f.detected && anomalyScore >= DETECT_ANOMALY_FRAC) {
       f.detected = true
