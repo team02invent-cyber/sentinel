@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
-import { answerQuery, generateCopilotResponse } from "@/lib/sentinel/copilot"
+import { answerQuery as _answerQuery, generateCopilotResponse, type LiveNetworkState } from "@/lib/sentinel/copilot"
 import { SentinelEngine, type RecoveryState } from "@/lib/sentinel/simulator"
 import type {
   ControllerState,
@@ -149,6 +149,37 @@ export function useSentinel() {
   const linkSeries = useCallback(
     (id: string, key: Parameters<SentinelEngine["linkSeries"]>[1]) =>
       engineRef.current!.linkSeries(id, key),
+    [],
+  )
+
+  /** answerQuery with live telemetry injected automatically */
+  const answerQuery = useCallback(
+    (query: string) => {
+      const engine = engineRef.current!
+      const frame = engine.lastFrame
+      const live: LiveNetworkState = {
+        activeEvent: engine.event
+          ? {
+              faultClass: engine.event.faultClass,
+              element: engine.event.element,
+              phase: engine.event.phase,
+              confidence: engine.event.confidence,
+            }
+          : null,
+        passBurstActive: engine.passActive,
+        topNodes: Object.entries(frame?.nodes ?? {}).slice(0, 4).map(([id, m]) => ({
+          id,
+          cpuPct: m.cpuPct,
+          queueDepthPct: m.queueDepthPct,
+          ldpUp: m.ldpUp,
+          ospfUp: m.ospfUp,
+        })),
+        controllerCompliance: engine.controllerState.policyCompliancePct,
+        tunnelsUp: engine.controllerState.tunnelsUp,
+        tunnelsTotal: engine.controllerState.tunnelsTotal,
+      }
+      return _answerQuery(query, live)
+    },
     [],
   )
 

@@ -172,6 +172,9 @@ export class SentinelEngine {
   /** Current controller state (updated each tick) */
   controllerState: ControllerState = this.buildNominalController()
 
+  /** Most recent TelemetryFrame emitted by tick() */
+  lastFrame: TelemetryFrame | null = null
+
   metrics: SessionMetrics = {
     injectedFaults: 0,
     truePositives: 0,
@@ -835,6 +838,7 @@ export class SentinelEngine {
     this.runPrediction(frame)
     this.emitNetFlow(frame)
     this.emitSyslog(frame)
+    this.lastFrame = frame
     return frame
   }
 

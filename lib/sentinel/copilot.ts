@@ -338,35 +338,15 @@ async function callOllamaLLM(prompt: string): Promise<{ response: string; infere
 }
 
 function buildLLMPrompt(event: PredictionEvent, docs: CorpusEntry[]): string {
-  const evidence = event.evidence.map((e) => `- ${e.label}: ${e.value} (${e.trend})`).join("\n")
-  const context = docs.map((d) => `[${d.id}] ${d.title}\n${d.content}`).join("\n\n")
-  return `You are Sentinel Copilot, an air-gapped network operations assistant. You explain predicted faults and provide remediation steps grounded ONLY in the provided runbooks. NEVER hallucinate. If you lack grounding, say "Insufficient grounding — escalate."
-
-**Prediction Event:**
-- Element: ${event.element} (${event.elementKind})
-- Fault class: ${event.faultClass}
-- Confidence: ${(event.confidence * 100).toFixed(0)}%
-- Time to impact: ${event.timeToImpactS}s
-- Evidence (summarized):
-${evidence}
-
-**Retrieved Runbooks:**
+  // Keep evidence to 3 rows max and docs to top-3 to minimise token count
+  const evidence = event.evidence.slice(0, 3).map((e) => `${e.label}: ${e.value}`).join(", ")
+  const context = docs.slice(0, 3).map((d) => `[${d.id}] ${d.content.slice(0, 300)}`).join("\n")
+  return `Sentinel Copilot (air-gapped NOC). Explain the fault and give remediation citing ONLY the runbooks below. No hallucination.
+FAULT: ${event.faultClass} on ${event.element}, ${(event.confidence*100).toFixed(0)}% conf, impact in ${event.timeToImpactS}s. Evidence: ${evidence}
+RUNBOOKS:
 ${context}
-
-**Task:**
-Provide a JSON object with these fields:
-{
-  "summary": { "text": "WHAT is happening", "source": "RB-XXX-NNN" },
-  "rootCause": { "text": "WHY it is happening", "source": "RB-XXX-NNN" },
-  "remediation": [
-    { "description": "Step 1", "command": "vtysh ...", "source": "RB-XXX-NNN" }
-  ],
-  "grounded": true or false
-}
-
-Every claim must cite a source from the retrieved runbooks. If you cannot ground all claims, set grounded: false and omit remediation.
-
-Output ONLY the JSON object, no extra text.`
+Reply with ONLY this JSON (no markdown, no extra text):
+{"summary":{"text":"...","source":"ID"},"rootCause":{"text":"...","source":"ID"},"remediation":[{"description":"...","command":"...","source":"ID"}],"grounded":true}`
 }
 
 function parseLLMResponse(raw: string, eventId: string): Omit<CopilotResponse, "schemaVersion" | "fromLLM" | "inferenceMs"> {
@@ -447,29 +427,42 @@ export async function generateCopilotResponse(req: CopilotRequest): Promise<Copi
   }
 }
 
-/**
- * Answer a free-text NOC operator query grounded in the RAG corpus.
- */
-export async function answerQuery(query: string): Promise<CopilotResponse> {
-  const docs = retrieveDocs(query, 5)
-  const context = docs.map((d) => `[${d.id}] ${d.title}\n${d.content}`).join("\n\n")
-  const prompt = `You are Sentinel Copilot. Answer the operator's query using ONLY the provided runbooks. NEVER hallucinate. If you lack grounding, say "Insufficient grounding."
-
-**Query:** ${query}
-
-**Retrieved Runbooks:**
-${context}
-
-**Task:**
-Provide a JSON object:
-{
-  "summary": { "text": "Answer to the query", "source": "RB-XXX-NNN" },
-  "rootCause": { "text": "Additional context if applicable", "source": "RB-XXX-NNN" },
-  "remediation": [],
-  "grounded": true
+export interface LiveNetworkState {
+  activeEvent: { faultClass: string; element: string; phase: string; confidence: number } | null
+  passBurstActive: boolean
+  topNodes: Array<{ id: string; cpuPct: number; queueDepthPct: number; ldpUp: number; ospfUp: number }>
+  controllerCompliance: number
+  tunnelsUp: number
+  tunnelsTotal: number
 }
 
-Output ONLY the JSON object.`
+/**
+ * Answer a free-text NOC operator query grounded in the RAG corpus.
+ * Accepts optional live network state so "what is happening now?" questions
+ * are answered from real telemetry, not just historical runbooks.
+ */
+export async function answerQuery(query: string, live?: LiveNetworkState): Promise<CopilotResponse> {
+  const docs = retrieveDocs(query, 3)
+  const context = docs.map((d) => `[${d.id}] ${d.content.slice(0, 300)}`).join("\n")
+
+  // Build compact live state block
+  let liveBlock = ""
+  if (live) {
+    const nodes = live.topNodes
+      .map((n) => `${n.id}: cpu=${n.cpuPct.toFixed(0)}% q=${n.queueDepthPct.toFixed(0)}% ldp=${n.ldpUp} ospf=${n.ospfUp}`)
+      .join(", ")
+    const fault = live.activeEvent
+      ? `ACTIVE FAULT: ${live.activeEvent.faultClass} on ${live.activeEvent.element} (phase=${live.activeEvent.phase}, conf=${(live.activeEvent.confidence * 100).toFixed(0)}%)`
+      : "No active fault"
+    liveBlock = `LIVE STATE: ${fault} | Pass=${live.passBurstActive ? "ACTIVE" : "idle"} | PolicyCompliance=${live.controllerCompliance.toFixed(0)}% | Tunnels=${live.tunnelsUp}/${live.tunnelsTotal} | Nodes: ${nodes}\n`
+  }
+
+  const prompt = `Sentinel Copilot (air-gapped NOC). Answer using ONLY the runbooks below + live state. No hallucination.
+${liveBlock}QUERY: ${query}
+RUNBOOKS:
+${context}
+Reply with ONLY this JSON (no markdown):
+{"summary":{"text":"...","source":"ID"},"rootCause":{"text":"...","source":"ID"},"remediation":[],"grounded":true}`
 
   try {
     const { response, inferenceMs } = await callOllamaLLM(prompt)
