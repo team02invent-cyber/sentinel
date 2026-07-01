@@ -200,6 +200,9 @@ export class SentinelEngine {
   /** Most recent TelemetryFrame emitted by tick() */
   lastFrame: TelemetryFrame | null = null
 
+  /** Most recent anomaly score (computed every tick to keep baselines warm). */
+  private lastAnomalyScore = 0
+
   metrics: SessionMetrics = {
     injectedFaults: 0,
     truePositives: 0,
@@ -268,8 +271,10 @@ export class SentinelEngine {
     // Per-element anomaly fraction. A real fault is localized, so we score each
     // element (node or link) against its OWN signals and take the worst-hit
     // element rather than diluting one hotspot across the whole fabric.
+    // Per-element anomaly fraction. A real fault is localized, so we score each
+    // element (node or link) against its OWN signals and take the worst-hit
+    // element rather than diluting one hotspot across the whole fabric.
     let maxFrac = 0
-    // Always update every EWMA tracker (so baselines stay warm), but score locally.
     for (const n of NODES) {
       const m = frame.nodes[n.id]
       let flagged = 0
@@ -449,13 +454,16 @@ export class SentinelEngine {
     const ctx = this.nodeFaultContext(id)
     if (!ctx) return
     const p = ctx.intensity
+    // Concave ramp: precursors emerge early in the fault window so the detector
+    // has genuine pre-impact lead time, while hard failures still land at p>=1.
+    const early = Math.sqrt(clamp(p, 0, 1)) * (p > 1 ? p : 1)
 
     switch (ctx.cls) {
       case "ldp_instability":
-        m.labelChurnPerS    = clamp(0.3 + p * 120 + noise(8), 0, 400)
-        m.jitterMs          = clamp(1.2 + p * 60 + noise(4), 0, 300)
-        m.cpuPct            = clamp(m.cpuPct + p * 45, 0, 100)
-        m.ospfConvergenceMs = clamp(8 + p * 800 + noise(30), 0, 5000)
+        m.labelChurnPerS    = clamp(0.3 + early * 130 + noise(8), 0, 400)
+        m.jitterMs          = clamp(1.2 + early * 65 + noise(4), 0, 300)
+        m.cpuPct            = clamp(m.cpuPct + early * 45, 0, 100)
+        m.ospfConvergenceMs = clamp(8 + early * 800 + noise(30), 0, 5000)
         if (p >= 1) {
           m.ldpUp = Math.random() < 0.6 ? 0 : 1
           m.lspUp = m.ldpUp
@@ -463,8 +471,9 @@ export class SentinelEngine {
         break
 
       case "congestion":
-        m.queueDepthPct = clamp(m.queueDepthPct + p * 78 + noise(5), 0, 100)
-        m.outMbps       = clamp(m.outMbps + p * 150, 0, 1000)
+        m.queueDepthPct = clamp(m.queueDepthPct + early * 80 + noise(5), 0, 100)
+        m.outMbps       = clamp(m.outMbps + early * 160, 0, 1000)
+        m.ifDiscardsPerS = clamp(early * 20 + noise(3), 0, 500)
         if (p >= 1) {
           m.ifDiscardsPerS = clamp(40 + noise(20), 0, 500)
         }
@@ -472,10 +481,10 @@ export class SentinelEngine {
 
       case "bgp_route_flap":
         // Primary signal: BGP prefix count oscillates, OSPF convergence spikes
-        m.bgpPrefixCount    = clamp(240 - p * 220 + noise(15) * (Math.random() > 0.5 ? 1 : -1), 0, 300)
-        m.ospfConvergenceMs = clamp(8 + p * 1200 + noise(50), 0, 5000)
-        m.cpuPct            = clamp(m.cpuPct + p * 35, 0, 100)
-        m.labelChurnPerS    = clamp(0.3 + p * 40 + noise(5), 0, 200)
+        m.bgpPrefixCount    = clamp(240 - early * 220 + noise(15) * (Math.random() > 0.5 ? 1 : -1), 0, 300)
+        m.ospfConvergenceMs = clamp(8 + early * 1200 + noise(50), 0, 5000)
+        m.cpuPct            = clamp(m.cpuPct + early * 35, 0, 100)
+        m.labelChurnPerS    = clamp(0.3 + early * 45 + noise(5), 0, 200)
         if (p >= 1) {
           m.ospfUp = Math.random() < 0.4 ? 0 : 1
           m.bgpPrefixCount = clamp(noise(20), 0, 50) // near-zero during flap
@@ -489,11 +498,11 @@ export class SentinelEngine {
 
       case "policy_drift":
         // Signal: rising orchestration latency, discards, CPU
-        m.queueDepthPct  = clamp(m.queueDepthPct + p * 40 + noise(5), 0, 100)
-        m.cpuPct         = clamp(m.cpuPct + p * 30, 0, 100)
-        m.ifDiscardsPerS = clamp(p * 25 + noise(5), 0, 100)
+        m.queueDepthPct  = clamp(m.queueDepthPct + early * 42 + noise(5), 0, 100)
+        m.cpuPct         = clamp(m.cpuPct + early * 30, 0, 100)
+        m.ifDiscardsPerS = clamp(early * 25 + noise(5), 0, 100)
         // Policy drift degrades jitter for traffic that loses QoS protection
-        m.jitterMs       = clamp(1.2 + p * 80 + noise(8), 0, 300)
+        m.jitterMs       = clamp(1.2 + early * 85 + noise(8), 0, 300)
         break
     }
   }
@@ -503,10 +512,15 @@ export class SentinelEngine {
     if (!ctx) return
     const p = ctx.intensity
 
+    // Concave (square-root) ramp: precursor signals surface EARLY in the fault
+    // window — physically realistic, since error/jitter creep up well before a
+    // link hard-fails — which gives the detector genuine pre-impact lead time.
+    const early = Math.sqrt(p)
+
     if (ctx.cls === "link_flap") {
-      lm.errorRatePct        = clamp(0.02 + p * p * 4.5 + noise(0.1), 0, 100)
-      lm.jitterTrendMsPerS   = clamp(p * 1.5 + noise(0.1), -5, 5)
-      lm.ecmpAsymmetryRatio  = clamp(1.0 + p * 0.4 + noise(0.05), 0.8, 2.0)
+      lm.errorRatePct        = clamp(0.02 + early * 5.0 + noise(0.1), 0, 100)
+      lm.jitterTrendMsPerS   = clamp(early * 3.0 + noise(0.1), -5, 5)
+      lm.ecmpAsymmetryRatio  = clamp(1.0 + early * 0.7 + noise(0.05), 0.8, 2.0)
       if (p >= 1) {
         lm.up               = 0
         lm.utilizationPct   = 0
@@ -519,8 +533,8 @@ export class SentinelEngine {
 
     if (ctx.cls === "bgp_route_flap") {
       // Link stays up but asymmetry spikes during route oscillation
-      lm.ecmpAsymmetryRatio = clamp(1.0 + p * 0.8 + noise(0.1), 0.8, 2.5)
-      lm.jitterTrendMsPerS  = clamp(p * 2 + noise(0.2), -5, 5)
+      lm.ecmpAsymmetryRatio = clamp(1.0 + early * 1.2 + noise(0.1), 0.8, 2.5)
+      lm.jitterTrendMsPerS  = clamp(early * 3.5 + noise(0.2), -5, 5)
       if (p > 0.7) lm.ikeState = "rekeying"
     }
   }
@@ -541,10 +555,10 @@ export class SentinelEngine {
     const ttiTotal  = f.leadTimeS
     const timeToImpactS = +(ttiTotal * (1 - p)).toFixed(1)
 
-    // EWMA anomaly score (the real detection criterion)
-    const anomalyScore = this.computeAnomalyScore(frame)
+    // EWMA anomaly score (already computed this tick in tick() so the detector
+    // baselines stay warm even while no fault is active).
+    const anomalyScore = this.lastAnomalyScore
 
-    console.log("[v0] anomalyScore", anomalyScore.toFixed(3), "progress", p.toFixed(2), "fault", f.faultClass, "detected", f.detected)
     // Detection fires when the anomaly score surpasses the threshold
     if (!f.detected && anomalyScore >= DETECT_ANOMALY_FRAC) {
       f.detected = true
@@ -893,6 +907,11 @@ export class SentinelEngine {
       h.push(links[l.id])
       if (h.length > HISTORY) h.shift()
     }
+
+    // Always run the anomaly detector so its EWMA baselines warm up on nominal
+    // data BEFORE any fault is injected — otherwise the trackers would learn the
+    // fault itself as their baseline and never flag a deviation.
+    this.lastAnomalyScore = this.computeAnomalyScore(frame)
 
     this.runPrediction(frame)
     this.emitNetFlow(frame)
