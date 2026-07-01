@@ -51,32 +51,36 @@
 
 :root {
   color-scheme: dark;
-  --radius: 0.5rem;
+  --radius: 0.75rem;
 
-  /* Deep mission-control charcoal, slightly cool. */
-  --background: oklch(0.16 0.006 247);
-  --foreground: oklch(0.93 0.005 247);
+  /* Near-black mission-control base (oddity-003 vibe) — lets the animated
+     shader glow through and makes the frosted glass panels pop. */
+  --background: oklch(0.13 0.008 250);
+  --foreground: oklch(0.95 0.005 247);
 
-  --card: oklch(0.196 0.007 247);
-  --card-foreground: oklch(0.93 0.005 247);
-  --popover: oklch(0.2 0.008 247);
-  --popover-foreground: oklch(0.93 0.005 247);
+  /* Translucent surfaces — combined with the global backdrop-blur below they
+     become liquid glass over the animated background. */
+  --card: oklch(0.22 0.012 250 / 0.55);
+  --card-foreground: oklch(0.95 0.005 247);
+  --popover: oklch(0.18 0.01 250 / 0.85);
+  --popover-foreground: oklch(0.95 0.005 247);
 
   /* Primary accent — instrument cyan. */
-  --primary: oklch(0.78 0.13 215);
-  --primary-foreground: oklch(0.16 0.006 247);
+  --primary: oklch(0.8 0.14 210);
+  --primary-foreground: oklch(0.13 0.008 250);
 
-  --secondary: oklch(0.26 0.009 247);
-  --secondary-foreground: oklch(0.93 0.005 247);
-  --muted: oklch(0.24 0.008 247);
-  --muted-foreground: oklch(0.66 0.012 247);
-  --accent: oklch(0.28 0.012 230);
-  --accent-foreground: oklch(0.95 0.005 247);
+  --secondary: oklch(0.3 0.014 250 / 0.5);
+  --secondary-foreground: oklch(0.95 0.005 247);
+  --muted: oklch(0.28 0.012 250 / 0.45);
+  --muted-foreground: oklch(0.72 0.014 247);
+  --accent: oklch(0.34 0.02 220 / 0.55);
+  --accent-foreground: oklch(0.97 0.005 247);
 
   --destructive: oklch(0.62 0.21 25);
-  --border: oklch(0.3 0.01 247);
-  --input: oklch(0.3 0.01 247);
-  --ring: oklch(0.78 0.13 215);
+  /* Light, low-alpha borders read as glass edges. */
+  --border: oklch(0.85 0.02 240 / 0.14);
+  --input: oklch(0.85 0.02 240 / 0.18);
+  --ring: oklch(0.8 0.14 210);
 
   /* Status signals */
   --ok: oklch(0.74 0.16 152);
@@ -101,9 +105,63 @@
   }
   body {
     @apply bg-background text-foreground;
+    /* Static base wash under the animated shader so text stays legible even
+       before/if the WebGL layer is disabled. */
+    background-image:
+      radial-gradient(1200px 800px at 15% -10%, oklch(0.3 0.09 210 / 0.18), transparent 60%),
+      radial-gradient(1000px 700px at 100% 0%, oklch(0.28 0.1 280 / 0.14), transparent 55%);
+    background-attachment: fixed;
   }
   html {
     @apply font-sans;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Liquid-glass surface system.
+ * Every translucent surface token gets a real frosted-glass backdrop blur,
+ * so all existing panels (bg-card / bg-popover / bg-secondary / bg-muted)
+ * become cohesive glass over the animated background with zero per-file edits.
+ * ------------------------------------------------------------------ */
+@layer utilities {
+  .bg-card,
+  .bg-popover,
+  .bg-secondary,
+  .bg-muted,
+  .bg-accent {
+    -webkit-backdrop-filter: blur(20px) saturate(150%);
+    backdrop-filter: blur(20px) saturate(150%);
+  }
+
+  /* Hero glass wrapper: adds the signature top light highlight + soft depth,
+     for the outermost app frame, header and key panels. */
+  .glass-panel {
+    position: relative;
+    background: linear-gradient(
+      180deg,
+      oklch(0.4 0.02 240 / 0.22) 0%,
+      oklch(0.2 0.012 250 / 0.42) 100%
+    );
+    -webkit-backdrop-filter: blur(24px) saturate(160%);
+    backdrop-filter: blur(24px) saturate(160%);
+    border: 1px solid oklch(0.9 0.02 240 / 0.12);
+    box-shadow:
+      inset 0 1px 0 0 oklch(1 0 0 / 0.08),
+      0 20px 50px -20px oklch(0 0 0 / 0.7);
+  }
+  /* Fine highlight line along the very top edge — the glass "wet" look. */
+  .glass-panel::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 1px;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      oklch(1 0 0 / 0.35),
+      transparent
+    );
+    pointer-events: none;
   }
 }
 

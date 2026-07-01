@@ -11,7 +11,7 @@ export function HeaderBar({ t, airGapped }: Props) {
   const mm = String(Math.floor(t / 60)).padStart(2, "0")
   const ss = String(t % 60).padStart(2, "0")
   return (
-    <header className="flex items-center justify-between border-b border-border bg-card px-4 py-3">
+    <header className="glass-panel sticky top-0 z-30 flex items-center justify-between !rounded-none px-4 py-3">
       <div className="flex items-center gap-3">
         <div className="flex size-8 items-center justify-center rounded-md border border-primary/40 bg-primary/10">
           <Activity className="size-4 text-primary" />

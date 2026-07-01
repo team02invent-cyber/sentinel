@@ -1,6 +1,8 @@
 "use client"
 
+import { useEffect, useState } from "react"
 import { useSentinel } from "@/hooks/use-sentinel"
+import { OnboardingOverlay } from "@/components/sentinel/onboarding-overlay"
 import { HeaderBar } from "@/components/sentinel/header-bar"
 import { ControlDeck } from "@/components/sentinel/control-deck"
 import { ResilienceBanner } from "@/components/sentinel/resilience-banner"
@@ -18,7 +20,20 @@ import { ClassifierPanel } from "@/components/sentinel/classifier-panel"
 import { HistoryPanel } from "@/components/sentinel/history-panel"
 import { exportSessionJSON, printIncidentReport } from "@/lib/sentinel/export"
 
+const ONBOARDING_KEY = "sentinel_onboarded_v1"
+
 export default function Page() {
+  // One-time onboarding: show the briefing only if this browser hasn't seen it.
+  // (localStorage is used purely for this UI flag, not for application data.)
+  const [showOnboarding, setShowOnboarding] = useState(false)
+  useEffect(() => {
+    if (!localStorage.getItem(ONBOARDING_KEY)) setShowOnboarding(true)
+  }, [])
+  const dismissOnboarding = () => {
+    localStorage.setItem(ONBOARDING_KEY, "1")
+    setShowOnboarding(false)
+  }
+
   const {
     snap,
     selected,
@@ -50,7 +65,8 @@ export default function Page() {
   }
 
   return (
-    <main className="flex min-h-screen flex-col bg-background">
+    <main className="flex min-h-screen flex-col">
+      {showOnboarding && <OnboardingOverlay onComplete={dismissOnboarding} />}
       <HeaderBar t={snap.t} airGapped={snap.airGapped} />
 
       <div className="flex flex-1 flex-col gap-3 p-3">
