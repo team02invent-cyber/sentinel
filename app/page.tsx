@@ -14,6 +14,9 @@ import { EvalPanel } from "@/components/sentinel/eval-panel"
 import { SyslogFeed } from "@/components/sentinel/syslog-feed"
 import { NetflowPanel } from "@/components/sentinel/netflow-panel"
 import { ControllerPanel } from "@/components/sentinel/controller-panel"
+import { ClassifierPanel } from "@/components/sentinel/classifier-panel"
+import { HistoryPanel } from "@/components/sentinel/history-panel"
+import { exportSessionJSON, printIncidentReport } from "@/lib/sentinel/export"
 
 export default function Page() {
   const {
@@ -33,7 +36,18 @@ export default function Page() {
     nodeSeries,
     linkSeries,
     answerQuery,
+    answerQueryStream,
+    history,
   } = useSentinel()
+
+  const exportSnap = {
+    event: snap.event,
+    copilot: snap.copilot,
+    metrics: snap.metrics,
+    eventLog: snap.eventLog,
+    controller: snap.controller,
+    t: snap.t,
+  }
 
   return (
     <main className="flex min-h-screen flex-col bg-background">
@@ -54,6 +68,8 @@ export default function Page() {
           onToggleRunning={toggleRunning}
           onReset={reset}
           onRunDemo={runDemo}
+          onExportJSON={() => exportSessionJSON(exportSnap)}
+          onPrintReport={() => printIncidentReport(exportSnap)}
         />
 
         {snap.airGapped && <ResilienceBanner running={running} />}
@@ -96,6 +112,7 @@ export default function Page() {
                 airGapped={snap.airGapped}
                 onRemediate={remediate}
                 onQuery={answerQuery}
+                onQueryStream={answerQueryStream}
               />
             </div>
             <div className="h-[200px]">
@@ -119,7 +136,17 @@ export default function Page() {
           <NetflowPanel flows={snap.flowLog} />
         </div>
 
-        {/* Row 4: Air-gap boundary | Evaluation methodology */}
+        {/* Row 4: Classifier performance | Incident history */}
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          <div className="min-h-[320px]">
+            <ClassifierPanel metrics={snap.metrics} />
+          </div>
+          <div className="min-h-[320px]">
+            <HistoryPanel history={history} />
+          </div>
+        </div>
+
+        {/* Row 5: Air-gap boundary | Evaluation methodology */}
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
           <div className="min-h-[380px]">
             <AirgapPanel airGapped={snap.airGapped} running={running} />

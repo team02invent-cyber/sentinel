@@ -1,7 +1,19 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
-import { answerQuery as _answerQuery, generateCopilotResponse, type LiveNetworkState } from "@/lib/sentinel/copilot"
+import {
+  answerQuery as _answerQuery,
+  answerQueryStream as _answerQueryStream,
+  generateCopilotResponse,
+  incidentToCorpusEntry,
+  registerPastIncident,
+  type LiveNetworkState,
+} from "@/lib/sentinel/copilot"
+import {
+  appendIncident,
+  loadHistory,
+  type PersistedIncident,
+} from "@/lib/sentinel/history"
 import { SentinelEngine, type RecoveryState } from "@/lib/sentinel/simulator"
 import type {
   ControllerState,
@@ -40,7 +52,10 @@ export function useSentinel() {
   const [running, setRunning] = useState(true)
   const [selected, setSelected] = useState<string | null>(null)
   const [demoStep, setDemoStep] = useState<string | null>(null)
+  const [history, setHistory] = useState<PersistedIncident[]>([])
   const demoCancelRef = useRef<(() => void) | null>(null)
+  /** ids of resolved incidents already persisted this session */
+  const persistedIdsRef = useRef<Set<string>>(new Set())
   const [snap, setSnap] = useState<SentinelSnapshot>({
     frame: null,
     event: null,
@@ -60,11 +75,53 @@ export function useSentinel() {
   // Cache the copilot response per event id so it isn't regenerated each tick.
   const copilotCache = useRef<{ id: string; resp: CopilotResponse } | null>(null)
 
+  // On mount: warm up the LLM (eliminates cold-start lag) and load past
+  // incidents from local storage back into the RAG corpus.
+  useEffect(() => {
+    // Fire-and-forget model warm-up
+    fetch("/api/copilot/warmup", { method: "POST" }).catch(() => {})
+
+    const past = loadHistory()
+    setHistory(past)
+    for (const inc of past) {
+      persistedIdsRef.current.add(inc.id)
+      registerPastIncident(
+        incidentToCorpusEntry({
+          id: inc.id,
+          faultClass: inc.faultClass,
+          element: inc.element,
+          outcome: inc.outcome,
+          leadTimeS: inc.leadTimeS,
+          ts: inc.ts,
+        }),
+      )
+    }
+  }, [])
+
   useEffect(() => {
     if (!running) return
     const engine = engineRef.current!
     const interval = setInterval(() => {
       const frame = engine.tick()
+
+      // Persist any newly-resolved incidents to local history + RAG corpus.
+      for (const ev of engine.eventLog) {
+        if (!ev.outcome || persistedIdsRef.current.has(ev.id)) continue
+        persistedIdsRef.current.add(ev.id)
+        const inc: PersistedIncident = {
+          id: ev.id,
+          faultClass: ev.faultClass,
+          element: ev.element,
+          outcome: ev.outcome,
+          leadTimeS: ev.leadTimeS,
+          confidence: ev.confidence,
+          ts: ev.remediatedAt ?? ev.createdAt,
+        }
+        const next = appendIncident(inc)
+        setHistory(next)
+        registerPastIncident(incidentToCorpusEntry(inc))
+      }
+
       let copilot: CopilotResponse | null = null
       if (engine.event) {
         if (copilotCache.current?.id !== engine.event.id) {
@@ -152,35 +209,44 @@ export function useSentinel() {
     [],
   )
 
-  /** answerQuery with live telemetry injected automatically */
+  /** Build the current live-network snapshot for grounding copilot queries. */
+  const buildLiveState = useCallback((): LiveNetworkState => {
+    const engine = engineRef.current!
+    const frame = engine.lastFrame
+    return {
+      activeEvent: engine.event
+        ? {
+            faultClass: engine.event.faultClass,
+            element: engine.event.element,
+            phase: engine.event.phase,
+            confidence: engine.event.confidence,
+          }
+        : null,
+      passBurstActive: engine.passActive,
+      topNodes: Object.entries(frame?.nodes ?? {}).slice(0, 4).map(([id, m]) => ({
+        id,
+        cpuPct: m.cpuPct,
+        queueDepthPct: m.queueDepthPct,
+        ldpUp: m.ldpUp,
+        ospfUp: m.ospfUp,
+      })),
+      controllerCompliance: engine.controllerState.policyCompliancePct,
+      tunnelsUp: engine.controllerState.tunnelsUp,
+      tunnelsTotal: engine.controllerState.tunnelsTotal,
+    }
+  }, [])
+
+  /** answerQuery with live telemetry injected automatically (non-streaming). */
   const answerQuery = useCallback(
-    (query: string) => {
-      const engine = engineRef.current!
-      const frame = engine.lastFrame
-      const live: LiveNetworkState = {
-        activeEvent: engine.event
-          ? {
-              faultClass: engine.event.faultClass,
-              element: engine.event.element,
-              phase: engine.event.phase,
-              confidence: engine.event.confidence,
-            }
-          : null,
-        passBurstActive: engine.passActive,
-        topNodes: Object.entries(frame?.nodes ?? {}).slice(0, 4).map(([id, m]) => ({
-          id,
-          cpuPct: m.cpuPct,
-          queueDepthPct: m.queueDepthPct,
-          ldpUp: m.ldpUp,
-          ospfUp: m.ospfUp,
-        })),
-        controllerCompliance: engine.controllerState.policyCompliancePct,
-        tunnelsUp: engine.controllerState.tunnelsUp,
-        tunnelsTotal: engine.controllerState.tunnelsTotal,
-      }
-      return _answerQuery(query, live)
-    },
-    [],
+    (query: string) => _answerQuery(query, buildLiveState()),
+    [buildLiveState],
+  )
+
+  /** Streaming answerQuery — onToken receives the growing answer text. */
+  const answerQueryStream = useCallback(
+    (query: string, onToken: (full: string) => void) =>
+      _answerQueryStream(query, buildLiveState(), onToken),
+    [buildLiveState],
   )
 
   return {
@@ -200,5 +266,7 @@ export function useSentinel() {
     nodeSeries,
     linkSeries,
     answerQuery,
+    answerQueryStream,
+    history,
   }
 }

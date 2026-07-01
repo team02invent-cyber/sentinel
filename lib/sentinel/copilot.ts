@@ -139,10 +139,28 @@ export const RAG_CORPUS: CorpusEntry[] = [
   },
 ]
 
-/** Build a simple embedding stub (in production: call sentence-transformers) */
+/* ------------------------------------------------------------------ *
+ * Dynamic corpus — past incidents persisted from prior sessions are
+ * registered here at runtime and become retrievable RAG documents,
+ * closing the "learn from past incidents" loop from the spec.
+ * ------------------------------------------------------------------ */
+const DYNAMIC_CORPUS: CorpusEntry[] = []
+
+/** Register a resolved incident as a retrievable RAG document. */
+export function registerPastIncident(entry: CorpusEntry) {
+  if (DYNAMIC_CORPUS.some((d) => d.id === entry.id)) return
+  entry.embedding = stubEmbedding(entry.title + " " + entry.content)
+  DYNAMIC_CORPUS.push(entry)
+  // Invalidate real-embedding cache so the new doc gets embedded on next retrieval
+  if (embeddingsMode === "real") embeddingsMode = "pending"
+}
+
+function allDocs(): CorpusEntry[] {
+  return [...RAG_CORPUS, ...DYNAMIC_CORPUS]
+}
+
+/** Build a deterministic hash-based embedding stub (offline fallback). */
 function stubEmbedding(text: string): number[] {
-  // Stub: return a 384-dim random vector seeded by text hash
-  // In production: POST to a local embedding service or use @xenova/transformers
   let hash = 0
   for (let i = 0; i < text.length; i++) hash = (hash << 5) - hash + text.charCodeAt(i)
   const rng = () => {
@@ -152,30 +170,92 @@ function stubEmbedding(text: string): number[] {
   return Array.from({ length: 384 }, () => rng())
 }
 
-// Precompute embeddings on module load
+// Precompute stub embeddings on module load (used until/unless real ones load)
 for (const doc of RAG_CORPUS) {
   doc.embedding = stubEmbedding(doc.title + " " + doc.content)
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {
   let dot = 0, magA = 0, magB = 0
-  for (let i = 0; i < a.length; i++) {
+  const n = Math.min(a.length, b.length)
+  for (let i = 0; i < n; i++) {
     dot += a[i] * b[i]
     magA += a[i] * a[i]
     magB += b[i] * b[i]
   }
-  return dot / (Math.sqrt(magA) * Math.sqrt(magB))
+  const denom = Math.sqrt(magA) * Math.sqrt(magB)
+  return denom === 0 ? 0 : dot / denom
 }
 
-/** Retrieve top-k most relevant docs for a query */
+/* ------------------------------------------------------------------ *
+ * Real semantic embeddings via Ollama nomic-embed-text (/api/copilot/embed)
+ * with graceful fallback to hash-based stub vectors when unavailable.
+ * ------------------------------------------------------------------ */
+type EmbeddingsMode = "pending" | "real" | "stub"
+let embeddingsMode: EmbeddingsMode = "pending"
+/** Real embeddings keyed by doc id (parallel to the stub in doc.embedding). */
+const realEmbeddings = new Map<string, number[]>()
+
+async function embedTexts(texts: string[]): Promise<number[][] | null> {
+  try {
+    const res = await fetch("/api/copilot/embed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ texts }),
+      signal: AbortSignal.timeout(45000),
+    })
+    if (!res.ok) return null
+    const data = (await res.json()) as { embeddings: number[][] }
+    return data.embeddings ?? null
+  } catch {
+    return null
+  }
+}
+
+/** Lazily embed the whole corpus with the real model. Returns true on success. */
+async function ensureRealEmbeddings(): Promise<boolean> {
+  if (embeddingsMode === "real") return true
+  if (embeddingsMode === "stub") return false
+  const docs = allDocs()
+  const embeddings = await embedTexts(docs.map((d) => `${d.title}. ${d.content}`))
+  if (!embeddings || embeddings.length !== docs.length) {
+    embeddingsMode = "stub"
+    return false
+  }
+  docs.forEach((d, i) => realEmbeddings.set(d.id, embeddings[i]))
+  embeddingsMode = "real"
+  console.log("[v0] RAG using real nomic-embed-text embeddings")
+  return true
+}
+
+/** Synchronous stub retrieval (offline fallback). */
 function retrieveDocs(query: string, k: number): CorpusEntry[] {
   const queryEmb = stubEmbedding(query)
-  const scored = RAG_CORPUS.map((doc) => ({
+  const scored = allDocs().map((doc) => ({
     doc,
     score: cosineSimilarity(queryEmb, doc.embedding!),
   }))
   scored.sort((a, b) => b.score - a.score)
   return scored.slice(0, k).map((s) => s.doc)
+}
+
+/** Async retrieval: real embeddings if the model is available, else stub. */
+async function retrieveDocsAsync(query: string, k: number): Promise<CorpusEntry[]> {
+  const ok = await ensureRealEmbeddings()
+  if (!ok) return retrieveDocs(query, k)
+  const [queryEmb] = (await embedTexts([query])) ?? []
+  if (!queryEmb) return retrieveDocs(query, k)
+  const scored = allDocs().map((doc) => ({
+    doc,
+    score: cosineSimilarity(queryEmb, realEmbeddings.get(doc.id) ?? doc.embedding!),
+  }))
+  scored.sort((a, b) => b.score - a.score)
+  return scored.slice(0, k).map((s) => s.doc)
+}
+
+/** Which retrieval mode is currently active (for UI display). */
+export function getEmbeddingsMode(): EmbeddingsMode {
+  return embeddingsMode
 }
 
 /* ------------------------------------------------------------------ *
@@ -398,9 +478,9 @@ export async function generateCopilotResponse(req: CopilotRequest): Promise<Copi
     }
   }
 
-  // Retrieve top-5 most relevant docs
+  // Retrieve top-5 most relevant docs (real embeddings if available)
   const query = `${event.faultClass} ${event.element} ${event.evidence.map((e) => e.label).join(" ")}`
-  const docs = retrieveDocs(query, 5)
+  const docs = await retrieveDocsAsync(query, 5)
 
   // Try real LLM
   try {
@@ -442,7 +522,7 @@ export interface LiveNetworkState {
  * are answered from real telemetry, not just historical runbooks.
  */
 export async function answerQuery(query: string, live?: LiveNetworkState): Promise<CopilotResponse> {
-  const docs = retrieveDocs(query, 3)
+  const docs = await retrieveDocsAsync(query, 3)
   const context = docs.map((d) => `[${d.id}] ${d.content.slice(0, 300)}`).join("\n")
 
   // Build compact live state block
@@ -495,6 +575,93 @@ Reply with ONLY this JSON (no markdown):
   }
 }
 
+/**
+ * Streaming variant of answerQuery — emits prose tokens live via onToken,
+ * then returns the final grounded response with retrieved-doc citations.
+ * Falls back to the non-streaming answerQuery if the stream is unavailable.
+ */
+export async function answerQueryStream(
+  query: string,
+  live: LiveNetworkState | undefined,
+  onToken: (full: string) => void,
+): Promise<CopilotResponse> {
+  const docs = await retrieveDocsAsync(query, 3)
+  const context = docs.map((d) => `[${d.id}] ${d.content.slice(0, 300)}`).join("\n")
+
+  let liveBlock = ""
+  if (live) {
+    const fault = live.activeEvent
+      ? `ACTIVE FAULT: ${live.activeEvent.faultClass} on ${live.activeEvent.element} (${(live.activeEvent.confidence * 100).toFixed(0)}% conf)`
+      : "No active fault"
+    liveBlock = `LIVE STATE: ${fault} | PolicyCompliance=${live.controllerCompliance.toFixed(0)}% | Tunnels=${live.tunnelsUp}/${live.tunnelsTotal}\n`
+  }
+
+  const prompt = `You are Sentinel Copilot, an air-gapped NOC assistant. Answer the operator's question in 2-4 concise sentences using ONLY the runbooks and live state below. Cite runbook IDs inline like [RB-BGP-031]. If you lack grounding, say so and recommend escalation.
+${liveBlock}QUESTION: ${query}
+RUNBOOKS:
+${context}
+ANSWER:`
+
+  try {
+    const res = await fetch("/api/copilot/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+      signal: AbortSignal.timeout(55000),
+    })
+    if (!res.ok || !res.body) throw new Error(`stream ${res.status}`)
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let full = ""
+    const start = Date.now()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      full += decoder.decode(value, { stream: true })
+      onToken(full)
+    }
+    const grounded = docs.length > 0
+    return {
+      schemaVersion: COPILOT_SCHEMA_VERSION,
+      eventId: `QUERY-${Date.now()}`,
+      answeredQuery: query,
+      fromLLM: true,
+      inferenceMs: Date.now() - start,
+      summary: { text: full.trim() || "No response.", source: docs[0]?.id ?? "ARCH-AIRGAP-001" },
+      rootCause: { text: "", source: docs[1]?.id ?? docs[0]?.id ?? "ARCH-AIRGAP-001" },
+      remediation: [],
+      grounded,
+      citedSources: docs.map((d) => d.id),
+    }
+  } catch {
+    // Fall back to the non-streaming (or template) path
+    return answerQuery(query, live)
+  }
+}
+
+/** Build a persistable RAG document from a resolved incident. */
+export function incidentToCorpusEntry(args: {
+  id: string
+  faultClass: string
+  element: string
+  outcome: string
+  leadTimeS: number
+  ts: number
+}): CorpusEntry {
+  const date = new Date(args.ts).toISOString().slice(0, 10)
+  return {
+    id: `PAST-${args.id}`,
+    title: `Past incident: ${args.faultClass} on ${args.element} (${args.outcome})`,
+    content: `Incident ${args.id} on ${date}: ${args.faultClass} predicted on ${args.element}. Outcome: ${args.outcome}. Lead time ${args.leadTimeS.toFixed(0)}s. Recorded from a prior Sentinel session and available for retrieval as operational history.`,
+  }
+}
+
 export function corpusTitle(id: string): string {
-  return RAG_CORPUS.find((d) => d.id === id)?.title ?? id
+  return allDocs().find((d) => d.id === id)?.title ?? id
+}
+
+/** Total number of documents available to the retriever (static + dynamic). */
+export function corpusSize(): number {
+  return allDocs().length
 }

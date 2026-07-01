@@ -235,6 +235,8 @@ export interface CopilotResponse {
   inferenceMs?: number
   /** NEW v2: the query this response answers (if operator-initiated) */
   answeredQuery?: string
+  /** NEW v2: retrieved corpus doc ids backing a streamed prose answer */
+  citedSources?: string[]
 }
 
 /* ------------------------------------------------------------------ *
@@ -312,4 +314,17 @@ export interface SessionMetrics {
   anomalyScores: number[]
   /** NEW v2: mean anomaly score at detection */
   meanAnomalyScore: number
+  /* --- NEW v2: full confusion matrix + derived classifier metrics --- */
+  /** Benign transients injected (the negative class). */
+  benignTransients: number
+  /** TN = benign transients correctly ignored (not escalated). */
+  trueNegatives: number
+  /** FN = real faults not caught before impact (injected − TP). */
+  falseNegatives: number
+  /** Precision = TP / (TP + FP). */
+  precision: number
+  /** Recall = TP / (TP + FN) (equals TPR). */
+  recall: number
+  /** F1 = harmonic mean of precision and recall. */
+  f1: number
 }

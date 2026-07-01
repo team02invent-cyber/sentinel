@@ -1,6 +1,6 @@
 "use client"
 
-import { Pause, Play, Radio, Satellite, Unplug, Cable, RotateCcw, Clapperboard } from "lucide-react"
+import { Pause, Play, Radio, Satellite, Unplug, Cable, RotateCcw, Clapperboard, FileJson, Printer } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import type { FaultClass } from "@/lib/sentinel/schema"
 
@@ -17,6 +17,8 @@ interface Props {
   onToggleRunning: () => void
   onReset: () => void
   onRunDemo: () => void
+  onExportJSON: () => void
+  onPrintReport: () => void
 }
 
 const FAULTS: { cls: FaultClass; label: string }[] = [
@@ -40,6 +42,8 @@ export function ControlDeck({
   onToggleRunning,
   onReset,
   onRunDemo,
+  onExportJSON,
+  onPrintReport,
 }: Props) {
   const demoRunning = !!demoStep
 
@@ -122,6 +126,31 @@ export function ControlDeck({
         >
           <RotateCcw className="size-3.5" />
           Reset
+        </Button>
+
+        <div className="mx-1 h-5 w-px bg-border" />
+
+        {/* Export */}
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={onExportJSON}
+          className="font-mono text-[11px]"
+          title="Download the session as JSON"
+        >
+          <FileJson className="size-3.5" />
+          Export JSON
+        </Button>
+
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={onPrintReport}
+          className="font-mono text-[11px]"
+          title="Open a printable incident report (Save as PDF)"
+        >
+          <Printer className="size-3.5" />
+          Report
         </Button>
 
         <div className="mx-1 h-5 w-px bg-border" />

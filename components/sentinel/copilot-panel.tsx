@@ -29,12 +29,14 @@ interface Props {
   airGapped: boolean
   onRemediate: () => void
   onQuery: (q: string) => Promise<CopilotResponse>
+  onQueryStream?: (q: string, onToken: (full: string) => void) => Promise<CopilotResponse>
 }
 
-export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate, onQuery }: Props) {
+export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate, onQuery, onQueryStream }: Props) {
   const active = event && copilot && (event.phase === "degrading" || event.phase === "imminent")
   const [query, setQuery] = useState("")
   const [queryResult, setQueryResult] = useState<CopilotResponse | null>(null)
+  const [streamText, setStreamText] = useState("")
   const [querying, setQuerying] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -43,11 +45,18 @@ export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate,
     if (!q) return
     setQuerying(true)
     setQueryResult(null)
+    setStreamText("")
     try {
-      const result = await onQuery(q)
-      setQueryResult(result)
+      if (onQueryStream) {
+        const result = await onQueryStream(q, (full) => setStreamText(full))
+        setQueryResult(result)
+      } else {
+        const result = await onQuery(q)
+        setQueryResult(result)
+      }
     } finally {
       setQuerying(false)
+      setStreamText("")
     }
   }
 
@@ -112,7 +121,9 @@ export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate,
       </div>
 
       <div className="flex-1 overflow-y-auto p-4">
-        {recovery ? (
+        {querying && streamText && !event ? (
+          <StreamingAnswer text={streamText} />
+        ) : recovery ? (
           <RecoverySuccess recovery={recovery} />
         ) : !displayResponse ? (
           <IdleState airGapped={airGapped} />
@@ -167,7 +178,23 @@ function IdleState({ airGapped }: { airGapped: boolean }) {
   )
 }
 
+function StreamingAnswer({ text }: { text: string }) {
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-1.5 font-mono text-[10px] text-[color:var(--ok)]">
+        <Cpu className="size-3 animate-pulse" />
+        Mistral is answering&hellip;
+      </div>
+      <p className="font-mono text-xs leading-relaxed text-foreground">
+        {text}
+        <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-primary align-middle" aria-hidden />
+      </p>
+    </div>
+  )
+}
+
 function QueryAnswer({ result }: { result: CopilotResponse }) {
+  const citations = result.citedSources ?? []
   return (
     <div className="flex flex-col gap-4">
       {result.answeredQuery && (
@@ -182,9 +209,25 @@ function QueryAnswer({ result }: { result: CopilotResponse }) {
           LLM response · {result.inferenceMs?.toFixed(0)}ms
         </div>
       )}
-      <Section title="Answer" body={result.summary.text} source={result.summary.source} />
+      <div>
+        <SectionLabel>Answer</SectionLabel>
+        <p className="mt-1 whitespace-pre-wrap font-mono text-xs leading-relaxed text-foreground">
+          {result.summary.text}
+        </p>
+        {citations.length === 0 && <Citation source={result.summary.source} />}
+      </div>
       {result.rootCause.text && result.rootCause.text !== result.summary.text && (
         <Section title="Context" body={result.rootCause.text} source={result.rootCause.source} />
+      )}
+      {citations.length > 0 && (
+        <div>
+          <SectionLabel>Grounded in</SectionLabel>
+          <div className="mt-1 flex flex-col gap-0.5">
+            {citations.map((s) => (
+              <Citation key={s} source={s} />
+            ))}
+          </div>
+        </div>
       )}
       {!result.grounded && result.escalation && (
         <div className="rounded border border-[color:var(--warn)]/30 bg-[color:var(--warn)]/5 px-3 py-2 font-mono text-[11px] text-[color:var(--warn)]">

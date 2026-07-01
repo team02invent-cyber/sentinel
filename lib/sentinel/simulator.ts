@@ -188,6 +188,12 @@ export class SentinelEngine {
     reactiveMttrS: 1500,
     anomalyScores: [],
     meanAnomalyScore: 0,
+    benignTransients: 0,
+    trueNegatives: 0,
+    falseNegatives: 0,
+    precision: 0,
+    recall: 0,
+    f1: 0,
   }
 
   /* EWMA trackers: nodeId -> metricKey -> tracker */
@@ -798,6 +804,22 @@ export class SentinelEngine {
     m.meanAnomalyScore = m.anomalyScores.length
       ? +(m.anomalyScores.reduce((a, b) => a + b, 0) / m.anomalyScores.length).toFixed(3)
       : 0
+
+    // Confusion matrix:
+    //   Positive class = real fault.  Negative class = benign transient.
+    //   TP = fault predicted before impact.  FP = benign transient escalated (falseAlarms).
+    //   FN = real fault not caught (injected − TP).  TN = benign correctly ignored.
+    const tp = m.truePositives
+    const fp = m.falseAlarms
+    m.falseNegatives = Math.max(0, m.injectedFaults - m.truePositives)
+    m.trueNegatives = Math.max(0, m.benignTransients - m.falseAlarms)
+    const fn = m.falseNegatives
+    m.precision = tp + fp > 0 ? +(tp / (tp + fp)).toFixed(3) : 0
+    m.recall = tp + fn > 0 ? +(tp / (tp + fn)).toFixed(3) : 0
+    m.f1 =
+      m.precision + m.recall > 0
+        ? +((2 * m.precision * m.recall) / (m.precision + m.recall)).toFixed(3)
+        : 0
   }
 
   /* ---------------------------------------------------------------- *
@@ -890,6 +912,8 @@ export class SentinelEngine {
       eventId:    `EVT-${Date.now().toString(36).toUpperCase()}`,
       benign:     true,
     }
+    this.metrics.benignTransients += 1
+    this.recomputeMetrics()
   }
 
   remediate() {
@@ -1007,6 +1031,8 @@ export class SentinelEngine {
       tpr: 0, farPer10Min: 0, leadTimesS: [], medianLeadTimeS: 0,
       packetsLossPrevented: 0, reactiveMttdS: 180, reactiveMttrS: 1500,
       anomalyScores: [], meanAnomalyScore: 0,
+      benignTransients: 0, trueNegatives: 0, falseNegatives: 0,
+      precision: 0, recall: 0, f1: 0,
     }
     for (const n of NODES) {
       this.nodeHist[n.id] = []
