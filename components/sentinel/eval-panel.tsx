@@ -16,7 +16,7 @@ const METRICS: MetricSpec[] = [
     symbol: "TPR",
     target: "≥ 90%",
     how: "TP / injected faults — fault is a TP if the prediction fires before impact.",
-    note: "Measured against held-out injected fault scenarios (all three classes, randomised lead times).",
+    note: "Measured against held-out injected fault scenarios (all five classes, randomised lead times).",
   },
   {
     name: "False Alarm Rate",
@@ -30,7 +30,7 @@ const METRICS: MetricSpec[] = [
     symbol: "LT₅₀",
     target: "45 – 90 s",
     how: "Time from first prediction emission to simulated packet-loss impact, per true-positive event.",
-    note: "Captured at the moment the detection threshold (ramp fraction = 0.18) is crossed.",
+    note: "Captured when the EWMA z-score anomaly score crosses the detection threshold (0.18).",
   },
   {
     name: "Inference Latency",
@@ -59,7 +59,7 @@ const DESIGN_TARGETS = [
   { label: "MTTD vs reactive", value: "−180 s", context: "Design target; reactive baseline ≈ 3 min MTTD." },
   { label: "MTTR vs reactive", value: "25 min → < 1 min", context: "Design target; grounded CLI cuts operator response time." },
   { label: "Topology", value: "7 nodes / 9 links", context: "Demo fixed topology. Production: per-node model → N nodes." },
-  { label: "Feature vector", value: "84-dim (12 × 7)", context: "Demo fixed. Production: 12 × N per-node with shared model." },
+  { label: "Feature vector", value: "98-dim (14 × 7)", context: "Demo fixed. Production: 14 × N per-node with shared model." },
 ]
 
 export function EvalPanel() {

@@ -52,7 +52,8 @@ export function CopilotPanel({ event, copilot, recovery, airGapped, onRemediate,
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (e.key === "Enter") handleQuery()
+    // Don't submit while a CJK IME is composing (Safari reports keyCode 229)
+    if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) handleQuery()
   }
 
   // If there is an active event, show event response. If query result exists and no active event, show query result.

@@ -22,7 +22,7 @@ export function HeaderBar({ t, airGapped }: Props) {
               Sentinel
             </h1>
             <span className="rounded border border-border px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-widest text-muted-foreground">
-              v1.0
+              v2.0
             </span>
           </div>
           <p className="font-mono text-[10px] text-muted-foreground">

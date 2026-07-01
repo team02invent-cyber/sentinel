@@ -23,6 +23,8 @@ const FAULTS: { cls: FaultClass; label: string }[] = [
   { cls: "link_flap", label: "Inject Link Flap" },
   { cls: "ldp_instability", label: "Inject LDP Churn" },
   { cls: "congestion", label: "Inject Congestion" },
+  { cls: "bgp_route_flap", label: "Inject BGP Flap" },
+  { cls: "policy_drift", label: "Inject Policy Drift" },
 ]
 
 export function ControlDeck({
