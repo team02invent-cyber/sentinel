@@ -49,7 +49,7 @@ export function ControlDeck({
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card px-3 py-2">
+      <div className="glass-panel flex flex-wrap items-center gap-2 rounded-xl px-3 py-2">
         {/* Manual fault injection */}
         <span className="mr-1 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
           Inject

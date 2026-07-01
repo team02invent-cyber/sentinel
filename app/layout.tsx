@@ -50,7 +50,7 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${geistSans.variable} ${geistMono.variable} bg-background`}>
       <body className="font-sans antialiased">
-        <ShaderBackground />
+        {/* <ShaderBackground /> temporarily disabled to isolate startup crash */}
         {children}
         {process.env.NODE_ENV === 'production' && <Analytics />}
       </body>
