@@ -124,7 +124,7 @@ export function OnboardingOverlay({ onComplete }: { onComplete: () => void }) {
         <audio ref={audioRef} src="/onboarding/narration.mp3" preload="auto" onEnded={finish} />
       )}
 
-      <div className="glass-panel relative z-10 flex w-full max-w-3xl flex-col items-center gap-8 rounded-2xl px-8 py-12 text-center sm:px-14">
+      <div className="glass-panel relative z-10 flex max-h-[92vh] w-full max-w-3xl flex-col items-center gap-6 overflow-y-auto rounded-2xl px-8 py-10 text-center sm:px-14">
         {/* Wordmark */}
         <div className="flex flex-col items-center gap-3">
           <div className="flex items-center gap-2.5">
@@ -163,14 +163,14 @@ export function OnboardingOverlay({ onComplete }: { onComplete: () => void }) {
         ) : (
           <>
             {/* Karaoke captions */}
-            <div className="flex min-h-[220px] flex-col justify-center gap-3">
+            <div className="flex flex-col justify-center gap-2.5">
               {lines.map((l, i) => {
                 const isActive = i === activeIdx
                 const isPast = i < activeIdx
                 return (
                   <p
                     key={i}
-                    className={`text-balance font-sans text-lg leading-relaxed transition-all duration-500 sm:text-xl ${
+                    className={`text-balance font-sans text-base leading-snug transition-all duration-500 sm:text-lg ${
                       isActive
                         ? "scale-100 font-medium text-primary opacity-100"
                         : isPast

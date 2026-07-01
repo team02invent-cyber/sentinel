@@ -1,0 +1,52 @@
+{
+  "voiceId": "pNInz6obpgDQGcFmaJgB",
+  "model": "eleven_multilingual_v2",
+  "duration": 37.338,
+  "lines": [
+    {
+      "line": "Every year, network outages cost enterprises billions.",
+      "start": 0,
+      "end": 3.959
+    },
+    {
+      "line": "And most are caught only after users are already impacted.",
+      "start": 4.133,
+      "end": 8.092
+    },
+    {
+      "line": "Sentinel changes that.",
+      "start": 8.475,
+      "end": 9.88
+    },
+    {
+      "line": "It watches your MPLS and SD-WAN fabric in real time, learning what normal looks like.",
+      "start": 10.159,
+      "end": 16.161
+    },
+    {
+      "line": "Then it predicts failures up to a minute before they cascade.",
+      "start": 16.544,
+      "end": 20.132
+    },
+    {
+      "line": "When trouble emerges, its air-gapped AI copilot explains the root cause,",
+      "start": 20.515,
+      "end": 25.31
+    },
+    {
+      "line": "and hands your engineers a remediation playbook.",
+      "start": 25.437,
+      "end": 28.514
+    },
+    {
+      "line": "All running fully offline, inside your secure perimeter.",
+      "start": 28.839,
+      "end": 33.216
+    },
+    {
+      "line": "This is network operations that can finally see the future.",
+      "start": 33.658,
+      "end": 37.338
+    }
+  ]
+}
