@@ -7,6 +7,10 @@
  */
 import { NextRequest, NextResponse } from "next/server"
 
+// Mistral 7B on Apple M-series CPU takes 8-20s first token, 20-45s full response.
+// Raise the Next.js route timeout so it does not cut the connection.
+export const maxDuration = 60
+
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434"
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "mistral"
 
@@ -26,9 +30,11 @@ export async function POST(req: NextRequest) {
         model: OLLAMA_MODEL,
         prompt,
         stream: false,
-        options: { temperature: 0.3, top_p: 0.9 },
+        // Lower temperature = less creative = fewer tokens = faster
+        // num_predict caps the output at 300 tokens — enough for structured JSON
+        options: { temperature: 0.1, top_p: 0.9, num_predict: 300 },
       }),
-      signal: AbortSignal.timeout(30000), // 30s — Mistral 7B needs more time on first token
+      signal: AbortSignal.timeout(55000), // 55s — below maxDuration so we can return an error
     })
 
     if (!ollamaRes.ok) {
